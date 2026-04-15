@@ -1,7 +1,10 @@
 import os
 import json
 import asyncio
+import smtplib
 import requests
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from datetime import datetime
 from typing import Optional, List
 from fastapi import FastAPI, HTTPException
@@ -40,6 +43,8 @@ MAILCHIMP_SERVER_PREFIX = os.getenv("MAILCHIMP_SERVER_PREFIX", "us7")
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 GOOGLE_CREDENTIALS_FILE = os.getenv("GOOGLE_CREDENTIALS_FILE", "google_credentials.json")
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")  # JSON string como variable de entorno
+GMAIL_USER = os.getenv("GMAIL_USER", "fedor.sawoloka@gmail.com")
+GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
 
 # --- Modelos de datos ---
 class FormData(BaseModel):
@@ -67,6 +72,7 @@ class GenerateResponse(BaseModel):
     document: Optional[str] = None
     error: Optional[str] = None
     fallback: bool = False
+    email_sent: bool = False
 
 # --- Funciones auxiliares ---
 
@@ -390,6 +396,74 @@ def subscribe_to_mailchimp(data: FormData, tags: dict):
         return False
 
 
+def send_document_by_email(recipient_email: str, document: str, nombre_cargo: str):
+    """Envía el Documento Maestro de Contexto por email al usuario."""
+    if not GMAIL_APP_PASSWORD:
+        print("GMAIL_APP_PASSWORD no configurado, omitiendo envío de email")
+        return False
+    
+    try:
+        # Extraer nombre del campo nombre_cargo
+        nombre = nombre_cargo.split(",")[0].strip() if "," in nombre_cargo else nombre_cargo.split()[0]
+        
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = "Tu Documento Maestro de Contexto para IA está listo"
+        msg["From"] = f"Fedor Sawoloka <{GMAIL_USER}>"
+        msg["To"] = recipient_email
+        
+        # Convertir el documento markdown a HTML básico
+        doc_html = document.replace("\n\n", "</p><p>").replace("\n", "<br>")
+        doc_html = doc_html.replace("## ", "<h2>").replace("# ", "<h1>")
+        # Cerrar etiquetas h1/h2 correctamente
+        lines = []
+        for line in document.split("\n"):
+            if line.startswith("## "):
+                lines.append(f"<h2>{line[3:]}</h2>")
+            elif line.startswith("# "):
+                lines.append(f"<h1>{line[2:]}</h1>")
+            elif line.startswith("---"):
+                lines.append("<hr>")
+            elif line.strip() == "":
+                lines.append("<br>")
+            else:
+                lines.append(f"<p>{line}</p>")
+        doc_html_clean = "\n".join(lines)
+        
+        html_body = f"""
+        <html>
+        <body style="font-family: Arial, sans-serif; max-width: 700px; margin: 0 auto; padding: 20px; color: #2C3E50;">
+            <div style="background: #2C3E50; padding: 20px; border-radius: 8px 8px 0 0;">
+                <h1 style="color: white; margin: 0; font-size: 20px;">Tu Documento Maestro de Contexto</h1>
+                <p style="color: #FF8C42; margin: 5px 0 0 0;">Generado con la metodología Gold Standard de Fedor Sawoloka</p>
+            </div>
+            <div style="background: #f5f6fa; padding: 25px; border-radius: 0 0 8px 8px; border: 1px solid #dee2e6;">
+                <p>Hola, aquí está tu documento listo para usar en cualquier IA.</p>
+                <p><strong>Instrucciones:</strong> Copia el texto del documento y pégalo al inicio de cualquier conversación con ChatGPT, Claude, Gemini u otra IA. A partir de ese momento, la IA te responderá como si te conociera de siempre.</p>
+                <hr style="border: 1px solid #dee2e6; margin: 20px 0;">
+                {doc_html_clean}
+                <hr style="border: 1px solid #dee2e6; margin: 20px 0;">
+                <p style="font-size: 12px; color: #6c757d;">Este documento fue generado en <a href="https://yosoyelruso.com/configura-tu-ia/" style="color: #FF8C42;">yosoyelruso.com/configura-tu-ia</a></p>
+            </div>
+        </body>
+        </html>
+        """
+        
+        text_body = f"Tu Documento Maestro de Contexto\n\n{document}\n\n---\nGenerado en yosoyelruso.com/configura-tu-ia"
+        
+        msg.attach(MIMEText(text_body, "plain", "utf-8"))
+        msg.attach(MIMEText(html_body, "html", "utf-8"))
+        
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
+            server.sendmail(GMAIL_USER, recipient_email, msg.as_string())
+        
+        print(f"Email enviado exitosamente a {recipient_email}")
+        return True
+    except Exception as e:
+        print(f"Error enviando email: {e}")
+        return False
+
+
 # --- Endpoints ---
 
 @app.get("/")
@@ -431,8 +505,16 @@ async def generate(data: FormData):
     except Exception as e:
         print(f"Mailchimp falló: {e}")
     
+    # Enviar documento por email
+    email_sent = False
+    try:
+        email_sent = send_document_by_email(data.email, document, data.nombre_cargo)
+    except Exception as e:
+        print(f"Email falló: {e}")
+    
     return GenerateResponse(
         success=True,
         document=document,
-        fallback=fallback_used
+        fallback=fallback_used,
+        email_sent=email_sent
     )

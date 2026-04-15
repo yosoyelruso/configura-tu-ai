@@ -39,6 +39,7 @@ MAILCHIMP_LIST_ID = os.getenv("MAILCHIMP_LIST_ID")
 MAILCHIMP_SERVER_PREFIX = os.getenv("MAILCHIMP_SERVER_PREFIX", "us7")
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 GOOGLE_CREDENTIALS_FILE = os.getenv("GOOGLE_CREDENTIALS_FILE", "google_credentials.json")
+GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")  # JSON string como variable de entorno
 
 # --- Modelos de datos ---
 class FormData(BaseModel):
@@ -256,14 +257,23 @@ Documento generado con base en la metodología Gold Standard de Fedor Sawoloka."
 def save_to_google_sheets(data: FormData, tags: dict):
     """Guarda las respuestas en Google Sheets."""
     try:
-        credentials_path = GOOGLE_CREDENTIALS_FILE
-        if not os.path.isabs(credentials_path):
-            credentials_path = os.path.join(os.path.dirname(__file__), credentials_path)
-        
-        creds = service_account.Credentials.from_service_account_file(
-            credentials_path,
-            scopes=["https://www.googleapis.com/auth/spreadsheets"]
-        )
+        # Usar variable de entorno JSON si está disponible (para producción en Render)
+        if GOOGLE_CREDENTIALS_JSON:
+            import json as json_module
+            creds_dict = json_module.loads(GOOGLE_CREDENTIALS_JSON)
+            creds = service_account.Credentials.from_service_account_info(
+                creds_dict,
+                scopes=["https://www.googleapis.com/auth/spreadsheets"]
+            )
+        else:
+            # Fallback: usar archivo local (para desarrollo)
+            credentials_path = GOOGLE_CREDENTIALS_FILE
+            if not os.path.isabs(credentials_path):
+                credentials_path = os.path.join(os.path.dirname(__file__), credentials_path)
+            creds = service_account.Credentials.from_service_account_file(
+                credentials_path,
+                scopes=["https://www.googleapis.com/auth/spreadsheets"]
+            )
         
         service = build("sheets", "v4", credentials=creds)
         sheet = service.spreadsheets()

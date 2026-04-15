@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: configura-tu-ia-backend
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: MAILCHIMP_API_KEY
+        sync: false
+      - key: MAILCHIMP_LIST_ID
+        sync: false
+      - key: MAILCHIMP_SERVER_PREFIX
+        value: us7
+      - key: GOOGLE_SHEET_ID
+        sync: false
+      - key: GOOGLE_CREDENTIALS_FILE
+        value: google_credentials.json

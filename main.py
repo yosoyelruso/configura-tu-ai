@@ -202,7 +202,7 @@ SECCIÓN 4 - CONTEXTO ADICIONAL:
 """
     
     response = client.models.generate_content(
-        model="gemini-2.0-flash",
+        model="gemini-2.5-flash-preview-04-17",
         contents=prompt
     )
     return response.text

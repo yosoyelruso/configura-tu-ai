@@ -11,7 +11,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
 from dotenv import load_dotenv
-from openai import OpenAI
+import google.generativeai as genai
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
@@ -36,7 +36,7 @@ app.add_middleware(
 )
 
 # --- Configuración ---
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 MAILCHIMP_API_KEY = os.getenv("MAILCHIMP_API_KEY")
 MAILCHIMP_LIST_ID = os.getenv("MAILCHIMP_LIST_ID")
 MAILCHIMP_SERVER_PREFIX = os.getenv("MAILCHIMP_SERVER_PREFIX", "us7")
@@ -165,14 +165,20 @@ def classify_profile(data: FormData) -> dict:
     }
 
 
-def generate_document_openai(data: FormData) -> str:
-    """Genera el Documento Maestro de Contexto usando OpenAI."""
-    client = OpenAI(api_key=OPENAI_API_KEY)
+def generate_document_gemini(data: FormData) -> str:
+    """Genera el Documento Maestro de Contexto usando Google Gemini."""
+    genai.configure(api_key=GEMINI_API_KEY)
+    model = genai.GenerativeModel("gemini-1.5-flash")
     
     estilo_str = ", ".join(data.estilo_comunicacion) if data.estilo_comunicacion else "No especificado"
     formato_str = ", ".join(data.formato_preferido) if data.formato_preferido else "No especificado"
     
-    user_content = f"""
+    prompt = f"""Eres un experto en inteligencia artificial y productividad profesional. Con base en las siguientes respuestas de un profesional, genera un Documento Maestro de Contexto claro, estructurado y en primera persona, listo para ser pegado en cualquier chat de IA. El documento debe tener: nombre y rol, filosofía de trabajo, audiencia y objetivos, estilo de comunicación preferido, y contexto de proyectos actuales. Que sea directo, sin adornos, y que la IA que lo lea entienda exactamente con quién está hablando y cómo debe responder.
+
+Al final del documento, en una línea aparte y en formato discreto, incluye exactamente este texto:
+---
+Documento generado con base en la metodología Gold Standard de Fedor Sawoloka.
+
 Respuestas del usuario:
 
 SECCIÓN 1 - IDENTIDAD Y ROL PROFESIONAL:
@@ -196,23 +202,8 @@ SECCIÓN 4 - CONTEXTO ADICIONAL:
 - Referencias / enlaces: {data.enlaces_referencia or 'No especificado'}
 """
     
-    system_prompt = """Eres un experto en inteligencia artificial y productividad profesional. Con base en las siguientes respuestas de un profesional, genera un Documento Maestro de Contexto claro, estructurado y en primera persona, listo para ser pegado en cualquier chat de IA. El documento debe tener: nombre y rol, filosofía de trabajo, audiencia y objetivos, estilo de comunicación preferido, y contexto de proyectos actuales. Que sea directo, sin adornos, y que la IA que lo lea entienda exactamente con quién está hablando y cómo debe responder.
-
-Al final del documento, en una línea aparte y en formato discreto, incluye exactamente este texto:
----
-Documento generado con base en la metodología Gold Standard de Fedor Sawoloka."""
-    
-    response = client.chat.completions.create(
-        model="gpt-4.1-mini",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_content}
-        ],
-        max_tokens=1500,
-        temperature=0.7
-    )
-    
-    return response.choices[0].message.content
+    response = model.generate_content(prompt)
+    return response.text
 
 
 def generate_document_fallback(data: FormData) -> str:
@@ -485,11 +476,11 @@ async def generate(data: FormData):
     document = None
     fallback_used = False
     
-    # Intentar generar con OpenAI
+    # Intentar generar con Gemini
     try:
-        document = generate_document_openai(data)
+        document = generate_document_gemini(data)
     except Exception as e:
-        print(f"OpenAI falló: {e}")
+        print(f"Gemini falló: {e}")
         fallback_used = True
         document = generate_document_fallback(data)
     

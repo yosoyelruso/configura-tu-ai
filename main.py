@@ -11,7 +11,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
 from dotenv import load_dotenv
-import google.generativeai as genai
+from google import genai as google_genai
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
@@ -167,8 +167,7 @@ def classify_profile(data: FormData) -> dict:
 
 def generate_document_gemini(data: FormData) -> str:
     """Genera el Documento Maestro de Contexto usando Google Gemini."""
-    genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel("gemini-1.5-flash")
+    client = google_genai.Client(api_key=GEMINI_API_KEY)
     
     estilo_str = ", ".join(data.estilo_comunicacion) if data.estilo_comunicacion else "No especificado"
     formato_str = ", ".join(data.formato_preferido) if data.formato_preferido else "No especificado"
@@ -202,7 +201,10 @@ SECCIÓN 4 - CONTEXTO ADICIONAL:
 - Referencias / enlaces: {data.enlaces_referencia or 'No especificado'}
 """
     
-    response = model.generate_content(prompt)
+    response = client.models.generate_content(
+        model="gemini-2.0-flash",
+        contents=prompt
+    )
     return response.text
 
 

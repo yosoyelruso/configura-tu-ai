@@ -3,17 +3,20 @@ import json
 import asyncio
 import smtplib
 import requests
+import io
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from datetime import datetime
 from typing import Optional, List
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, EmailStr
 from dotenv import load_dotenv
 from google import genai as google_genai
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+from fpdf import FPDF
 
 load_dotenv()
 
@@ -78,6 +81,10 @@ class GenerateResponse(BaseModel):
     error: Optional[str] = None
     fallback: bool = False
     email_sent: bool = False
+
+class PdfRequest(BaseModel):
+    document: str
+    nombre: Optional[str] = "Profesional"
 
 # --- Funciones auxiliares ---
 
@@ -560,3 +567,74 @@ async def generate(data: FormData):
         fallback=fallback_used,
         email_sent=email_sent
     )
+
+@app.post("/download-pdf")
+def download_pdf(req: PdfRequest):
+    """Genera un PDF del documento maestro y lo devuelve como archivo descargable."""
+    try:
+        pdf = FPDF(orientation='P', unit='mm', format='A4')
+        pdf.set_auto_page_break(auto=True, margin=15)
+        pdf.add_page()
+
+        # Encabezado con fondo azul
+        pdf.set_fill_color(44, 62, 80)
+        pdf.rect(0, 0, 210, 22, 'F')
+        pdf.set_text_color(255, 255, 255)
+        pdf.set_font('Helvetica', 'B', 13)
+        pdf.set_xy(15, 8)
+        pdf.cell(0, 8, 'Documento Maestro de Contexto', ln=False)
+        pdf.set_font('Helvetica', '', 9)
+        pdf.set_text_color(255, 140, 66)
+        pdf.set_xy(15, 16)
+        pdf.cell(0, 6, 'Metodologia Gold Standard  |  yosoyelruso.com', ln=False)
+
+        pdf.set_y(28)
+        pdf.set_text_color(44, 62, 80)
+
+        lines = req.document.split('\n')
+        for line in lines:
+            line = line.strip()
+            if line.startswith('## '):
+                pdf.ln(4)
+                pdf.set_font('Helvetica', 'B', 12)
+                pdf.set_text_color(44, 62, 80)
+                pdf.multi_cell(0, 6, line[3:], ln=True)
+                pdf.set_draw_color(255, 140, 66)
+                pdf.set_line_width(0.5)
+                pdf.line(15, pdf.get_y(), 195, pdf.get_y())
+                pdf.ln(3)
+            elif line.startswith('# '):
+                pdf.ln(4)
+                pdf.set_font('Helvetica', 'B', 14)
+                pdf.set_text_color(44, 62, 80)
+                pdf.multi_cell(0, 7, line[2:], ln=True)
+                pdf.ln(2)
+            elif line.startswith('---'):
+                pdf.ln(2)
+                pdf.set_draw_color(200, 200, 200)
+                pdf.set_line_width(0.3)
+                pdf.line(15, pdf.get_y(), 195, pdf.get_y())
+                pdf.ln(3)
+            elif line == '':
+                pdf.ln(3)
+            else:
+                # Limpiar asteriscos de markdown bold
+                clean = line.replace('**', '').replace('*', '')
+                pdf.set_font('Helvetica', '', 10)
+                pdf.set_text_color(60, 60, 60)
+                pdf.multi_cell(0, 5, clean, ln=True)
+
+        pdf_bytes = pdf.output()
+        pdf_buffer = io.BytesIO(bytes(pdf_bytes))
+        nombre_archivo = 'documento-maestro-contexto.pdf'
+
+        return StreamingResponse(
+            pdf_buffer,
+            media_type='application/pdf',
+            headers={
+                'Content-Disposition': f'attachment; filename="{nombre_archivo}"',
+                'Content-Type': 'application/pdf'
+            }
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f'Error generando PDF: {str(e)}')

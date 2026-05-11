@@ -8,3 +8,4 @@ google-api-python-client==2.149.0
 requests==2.32.3
 pydantic==2.9.2
 python-multipart==0.0.12
+fpdf2==2.7.9

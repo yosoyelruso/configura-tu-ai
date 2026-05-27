@@ -739,6 +739,48 @@ BLOQUE 5 — CONTEXTO:
 
 
 # ============================================================
+# ENDPOINT DE DIAGNÓSTICO (temporal — solo para debugging)
+# ============================================================
+
+@app.get("/programa/diagnostico")
+def diagnostico_programa():
+    """Endpoint temporal para verificar configuración del programa."""
+    resultado = {}
+    try:
+        service = get_google_sheets_service()
+        # Obtener info del spreadsheet (pestañas disponibles)
+        spreadsheet = service.spreadsheets().get(
+            spreadsheetId=PROGRAMA_SHEET_ID
+        ).execute()
+        pestanas = [s['properties']['title'] for s in spreadsheet.get('sheets', [])]
+        resultado['sheet_id'] = PROGRAMA_SHEET_ID
+        resultado['pestanas_disponibles'] = pestanas
+        resultado['acceso_sheet'] = 'OK'
+
+        # Intentar leer Acceso_Programa
+        try:
+            values_result = service.spreadsheets().values().get(
+                spreadsheetId=PROGRAMA_SHEET_ID,
+                range="Acceso_Programa!A:B"
+            ).execute()
+            valores = values_result.get('values', [])
+            resultado['acceso_programa_filas'] = len(valores)
+            resultado['acceso_programa_contenido'] = valores[:5]  # primeras 5 filas
+        except Exception as e2:
+            resultado['error_lectura_acceso_programa'] = str(e2)
+
+        # Obtener email de la cuenta de servicio
+        if GOOGLE_CREDENTIALS_JSON:
+            creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
+            resultado['service_account_email'] = creds_dict.get('client_email', 'no encontrado')
+
+    except Exception as e:
+        resultado['error'] = str(e)
+
+    return resultado
+
+
+# ============================================================
 # ENDPOINTS — Configura tu IA (existentes, sin cambios)
 # ============================================================
 

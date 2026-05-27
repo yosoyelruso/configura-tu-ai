@@ -552,6 +552,43 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> str:
         return ""
 
 
+def limpiar_para_pdf(texto: str) -> str:
+    """
+    Convierte caracteres Unicode especiales a equivalentes ASCII/Latin-1
+    compatibles con la fuente Helvetica de fpdf2.
+    """
+    reemplazos = {
+        # Comillas tipográficas
+        '\u2018': "'", '\u2019': "'", '\u201a': "'", '\u201b': "'",
+        '\u201c': '"', '\u201d': '"', '\u201e': '"', '\u201f': '"',
+        # Guiones especiales
+        '\u2013': '-', '\u2014': '-', '\u2015': '-',
+        # Puntos suspensivos
+        '\u2026': '...',
+        # Espacios especiales
+        '\u00a0': ' ', '\u202f': ' ', '\u2009': ' ',
+        # Flechas y símbolos comunes
+        '\u2192': '->', '\u2190': '<-', '\u2022': '-', '\u25cf': '-',
+        '\u2713': 'OK', '\u2714': 'OK', '\u2715': 'X', '\u2716': 'X',
+        '\u2610': '[ ]', '\u2611': '[X]',
+        # Fracciones y superscripts
+        '\u00bd': '1/2', '\u00bc': '1/4', '\u00be': '3/4',
+        # Otros comunes
+        '\u00b7': '-', '\u2217': '*', '\u00d7': 'x', '\u00f7': '/',
+    }
+    for char, reemplazo in reemplazos.items():
+        texto = texto.replace(char, reemplazo)
+    # Eliminar cualquier caracter fuera del rango Latin-1 que quede
+    resultado = []
+    for c in texto:
+        try:
+            c.encode('latin-1')
+            resultado.append(c)
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            resultado.append('?')
+    return ''.join(resultado)
+
+
 def generate_pdf_branded(content: str, titulo: str, subtitulo: str, nombre_archivo: str) -> bytes:
     """
     Genera un PDF con branding de la marca Anti-Inercia.
@@ -575,6 +612,11 @@ def generate_pdf_branded(content: str, titulo: str, subtitulo: str, nombre_archi
 
     pdf.set_y(35)
     pdf.set_text_color(44, 62, 80)
+
+    # Limpiar todo el contenido antes de procesar
+    content = limpiar_para_pdf(content)
+    titulo = limpiar_para_pdf(titulo)
+    subtitulo = limpiar_para_pdf(subtitulo)
 
     lines = content.split('\n')
     for line in lines:

@@ -594,6 +594,11 @@ def generate_pdf_branded(content: str, titulo: str, subtitulo: str, nombre_archi
     Genera un PDF con branding de la marca Anti-Inercia.
     Paleta: Azul marino #2C3E50, Naranja #FF8C42, Blanco, Gris claro.
     """
+    # Limpiar TODOS los textos antes de cualquier operacion PDF
+    content = limpiar_para_pdf(content)
+    titulo = limpiar_para_pdf(titulo)
+    subtitulo = limpiar_para_pdf(subtitulo)
+
     pdf = FPDF(orientation='P', unit='mm', format='A4')
     pdf.set_auto_page_break(auto=True, margin=20)
     pdf.add_page()
@@ -612,11 +617,6 @@ def generate_pdf_branded(content: str, titulo: str, subtitulo: str, nombre_archi
 
     pdf.set_y(35)
     pdf.set_text_color(44, 62, 80)
-
-    # Limpiar todo el contenido antes de procesar
-    content = limpiar_para_pdf(content)
-    titulo = limpiar_para_pdf(titulo)
-    subtitulo = limpiar_para_pdf(subtitulo)
 
     lines = content.split('\n')
     for line in lines:

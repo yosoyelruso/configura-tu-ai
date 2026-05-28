@@ -4,14 +4,16 @@ import asyncio
 import smtplib
 import requests
 import io
+import uuid
+import threading
 import pdfplumber
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from datetime import datetime
-from typing import Optional, List
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from typing import Optional, List, Dict, Any
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel, EmailStr
 from dotenv import load_dotenv
 from google import genai as google_genai
@@ -21,7 +23,60 @@ from fpdf import FPDF
 
 load_dotenv()
 
-app = FastAPI(title="Fedor Sawoloka - API Backend v3.0")
+app = FastAPI(title="Fedor Sawoloka - API Backend v4.0")
+
+# ============================================================
+# JOB QUEUE — Sistema de procesamiento asíncrono
+# ============================================================
+# Almacena los trabajos en memoria. En Render (plan Starter)
+# el proceso vive indefinidamente, así que esto es seguro.
+# Los trabajos se limpian automáticamente después de 1 hora.
+
+jobs: Dict[str, Dict[str, Any]] = {}
+jobs_lock = threading.Lock()
+
+def crear_job(job_id: str):
+    """Crea un nuevo trabajo en estado 'processing'."""
+    with jobs_lock:
+        jobs[job_id] = {
+            'status': 'processing',
+            'created_at': datetime.now().isoformat(),
+            'pdf_bytes': None,
+            'filename': None,
+            'error': None
+        }
+
+def completar_job(job_id: str, pdf_bytes: bytes, filename: str):
+    """Marca un trabajo como completado con el PDF generado."""
+    with jobs_lock:
+        if job_id in jobs:
+            jobs[job_id]['status'] = 'done'
+            jobs[job_id]['pdf_bytes'] = pdf_bytes
+            jobs[job_id]['filename'] = filename
+
+def fallar_job(job_id: str, error: str):
+    """Marca un trabajo como fallido."""
+    with jobs_lock:
+        if job_id in jobs:
+            jobs[job_id]['status'] = 'error'
+            jobs[job_id]['error'] = error
+
+def limpiar_jobs_viejos():
+    """Elimina trabajos con más de 1 hora de antigüedad."""
+    from datetime import timedelta
+    ahora = datetime.now()
+    con_jobs_lock = threading.Lock()
+    with jobs_lock:
+        ids_a_eliminar = []
+        for jid, job in jobs.items():
+            try:
+                creado = datetime.fromisoformat(job['created_at'])
+                if (ahora - creado) > timedelta(hours=1):
+                    ids_a_eliminar.append(jid)
+            except:
+                pass
+        for jid in ids_a_eliminar:
+            del jobs[jid]
 
 # CORS: permitir peticiones desde yosoyelruso.com y localhost
 app.add_middleware(
@@ -1742,3 +1797,728 @@ async def generar_modulo3(
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f'Error generando PDF: {str(e)}')
+
+
+# ============================================================
+# ENDPOINTS ASÍNCRONOS — Sistema Job Queue para el Programa
+# ============================================================
+# Nuevo flujo:
+# 1. POST /programa/moduloN/iniciar → recibe datos, lanza tarea en background, devuelve job_id
+# 2. GET  /programa/job/{job_id}    → devuelve estado del trabajo
+# 3. GET  /programa/job/{job_id}/pdf → descarga el PDF cuando está listo
+# Esto elimina timeouts independientemente de cuánto tarde Gemini.
+
+@app.get("/programa/job/{job_id}")
+def consultar_job(job_id: str):
+    """Consulta el estado de un trabajo de generación."""
+    limpiar_jobs_viejos()
+    with jobs_lock:
+        job = jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Trabajo no encontrado o expirado.")
+    return {
+        "job_id": job_id,
+        "status": job["status"],
+        "filename": job.get("filename"),
+        "error": job.get("error")
+    }
+
+
+@app.get("/programa/job/{job_id}/pdf")
+def descargar_pdf_job(job_id: str):
+    """Descarga el PDF de un trabajo completado."""
+    with jobs_lock:
+        job = jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Trabajo no encontrado o expirado.")
+    if job["status"] != "done":
+        raise HTTPException(status_code=400, detail=f"El trabajo aún no está listo. Estado: {job['status']}")
+    pdf_bytes = job["pdf_bytes"]
+    filename = job.get("filename", "documento.pdf")
+    # Limpiar el job después de la descarga
+    with jobs_lock:
+        if job_id in jobs:
+            del jobs[job_id]
+    return StreamingResponse(
+        io.BytesIO(pdf_bytes),
+        media_type='application/pdf',
+        headers={
+            'Content-Disposition': f'attachment; filename="{filename}"',
+            'Content-Type': 'application/pdf'
+        }
+    )
+
+
+# ── Módulo 0 asíncrono ──
+
+def _procesar_modulo0(job_id: str, respuestas: dict, email: str, disposicion: str, horas_semanales: str):
+    try:
+        documento = generate_modulo0_gemini(respuestas)
+        pdf_bytes = generate_pdf_branded(
+            content=documento,
+            titulo="Mapa de Fricciones — Modulo 0",
+            subtitulo="Programa Anti-Inercia de Marca Personal  |  yosoyelruso.com",
+            nombre_archivo="mapa-de-fricciones-modulo-0.pdf"
+        )
+        completar_job(job_id, pdf_bytes, "mapa-de-fricciones-modulo-0.pdf")
+        try:
+            save_programa_lead(email, 0, {"disposicion": disposicion, "horas": horas_semanales})
+        except Exception as e:
+            print(f"Error registrando actividad M0: {e}")
+    except Exception as e:
+        print(f"Error procesando M0 job {job_id}: {e}")
+        fallar_job(job_id, str(e))
+
+
+@app.post("/programa/modulo0/iniciar")
+async def iniciar_modulo0(
+    background_tasks: BackgroundTasks,
+    email: str = Form(...),
+    dedicacion: str = Form(...),
+    tiempo_independiente: str = Form(...),
+    fuente_clientes: str = Form(...),
+    clientes_activos: str = Form(...),
+    flujo_clientes: str = Form(...),
+    servicios_definidos: str = Form(...),
+    facilidad_explicar: str = Form(...),
+    diferenciador: str = Form(...),
+    resultado_cliente: str = Form(...),
+    plataformas: str = Form(...),
+    frecuencia_publicacion: str = Form(...),
+    google_resultado: str = Form(...),
+    perfil_actual: str = Form(...),
+    razon_principal: str = Form(...),
+    razon_ampliacion: str = Form(default=""),
+    intento_previo: str = Form(...),
+    que_fallo: str = Form(default=""),
+    disposicion: str = Form(...),
+    exito_definido: str = Form(...),
+    horas_semanales: str = Form(...),
+    nivel_digital: str = Form(...),
+    presupuesto: str = Form(...)
+):
+    if not check_email_access(email):
+        raise HTTPException(status_code=403, detail="Este correo no tiene acceso al programa.")
+
+    job_id = str(uuid.uuid4())
+    crear_job(job_id)
+
+    respuestas = {
+        "dedicacion": dedicacion, "tiempo_independiente": tiempo_independiente,
+        "fuente_clientes": fuente_clientes, "clientes_activos": clientes_activos,
+        "flujo_clientes": flujo_clientes, "servicios_definidos": servicios_definidos,
+        "facilidad_explicar": facilidad_explicar, "diferenciador": diferenciador,
+        "resultado_cliente": resultado_cliente, "plataformas": plataformas,
+        "frecuencia_publicacion": frecuencia_publicacion, "google_resultado": google_resultado,
+        "perfil_actual": perfil_actual, "razon_principal": razon_principal,
+        "razon_ampliacion": razon_ampliacion, "intento_previo": intento_previo,
+        "que_fallo": que_fallo, "disposicion": disposicion, "exito_definido": exito_definido,
+        "horas_semanales": horas_semanales, "nivel_digital": nivel_digital, "presupuesto": presupuesto
+    }
+
+    background_tasks.add_task(_procesar_modulo0, job_id, respuestas, email, disposicion, horas_semanales)
+    return {"job_id": job_id, "status": "processing"}
+
+
+# ── Módulo 1 asíncrono ──
+
+def _procesar_modulo1(job_id: str, respuestas: dict, contexto_m0: str, email: str, perfiles: str):
+    try:
+        documento = generate_modulo1_gemini(respuestas, contexto_m0)
+        pdf_bytes = generate_pdf_branded(
+            content=documento,
+            titulo="Documento de Auditoria y Diagnostico — Modulo 1",
+            subtitulo="Programa Anti-Inercia de Marca Personal  |  yosoyelruso.com",
+            nombre_archivo="auditoria-diagnostico-modulo-1.pdf"
+        )
+        completar_job(job_id, pdf_bytes, "auditoria-diagnostico-modulo-1.pdf")
+        try:
+            save_programa_lead(email, 1, {"perfiles_analizados": perfiles})
+        except Exception as e:
+            print(f"Error registrando actividad M1: {e}")
+    except Exception as e:
+        print(f"Error procesando M1 job {job_id}: {e}")
+        fallar_job(job_id, str(e))
+
+
+@app.post("/programa/modulo1/iniciar")
+async def iniciar_modulo1(
+    background_tasks: BackgroundTasks,
+    email: str = Form(...),
+    foto_perfil: str = Form(...),
+    bio_actual: str = Form(...),
+    claridad_bio: str = Form(...),
+    cta_perfil: str = Form(...),
+    patron_publicaciones: str = Form(...),
+    nivel_interaccion: str = Form(...),
+    canales_secundarios: str = Form(default=""),
+    tiene_web: str = Form(...),
+    web_primeros_segundos: str = Form(default=""),
+    web_formulario: str = Form(default=""),
+    web_captacion: str = Form(default=""),
+    comp1_nombre: str = Form(...), comp1_razon: str = Form(...),
+    comp1_posicionamiento: str = Form(...), comp1_contenido: str = Form(...),
+    comp1_interaccion: str = Form(...), comp1_fortaleza: str = Form(...),
+    comp1_debilidad: str = Form(...), comp1_ventaja: str = Form(...),
+    comp1_oportunidad: str = Form(...),
+    comp2_nombre: str = Form(...), comp2_razon: str = Form(...),
+    comp2_posicionamiento: str = Form(...), comp2_contenido: str = Form(...),
+    comp2_interaccion: str = Form(...), comp2_fortaleza: str = Form(...),
+    comp2_debilidad: str = Form(...), comp2_ventaja: str = Form(...),
+    comp2_oportunidad: str = Form(...),
+    comp3_nombre: str = Form(...), comp3_razon: str = Form(...),
+    comp3_posicionamiento: str = Form(...), comp3_contenido: str = Form(...),
+    comp3_interaccion: str = Form(...), comp3_fortaleza: str = Form(...),
+    comp3_debilidad: str = Form(...), comp3_ventaja: str = Form(...),
+    comp3_oportunidad: str = Form(...),
+    patron_competencia: str = Form(...), hueco_mercado: str = Form(...),
+    aprendizaje_competencia: str = Form(...),
+    cliente_ideal: str = Form(...), problema_cliente: str = Form(...),
+    intentos_cliente: str = Form(...), palabras_cliente: str = Form(...),
+    resultado_buscado: str = Form(...), donde_esta_cliente: str = Form(...),
+    razon_sin_resolver: str = Form(...),
+    fortalezas: str = Form(...), debilidades: str = Form(...),
+    oportunidades: str = Form(...), amenazas: str = Form(...),
+    inercia1_patron: str = Form(...), inercia1_manifestacion: str = Form(...),
+    inercia1_tiempo: str = Form(...), inercia1_intentos: str = Form(...),
+    inercia2_patron: str = Form(...), inercia2_manifestacion: str = Form(...),
+    inercia2_tiempo: str = Form(...), inercia2_intentos: str = Form(...),
+    inercia3_patron: str = Form(...), inercia3_manifestacion: str = Form(...),
+    inercia3_tiempo: str = Form(...), inercia3_intentos: str = Form(...),
+    pdf_m0: UploadFile = File(...)
+):
+    if not check_email_access(email):
+        raise HTTPException(status_code=403, detail="Este correo no tiene acceso al programa.")
+
+    contexto_m0 = extract_text_from_pdf(await pdf_m0.read())
+    job_id = str(uuid.uuid4())
+    crear_job(job_id)
+
+    respuestas = {k: v for k, v in locals().items()
+                  if k not in ['email', 'pdf_m0', 'contexto_m0', 'background_tasks', 'job_id']}
+
+    background_tasks.add_task(_procesar_modulo1, job_id, respuestas, contexto_m0, email,
+                               f"{comp1_nombre}, {comp2_nombre}, {comp3_nombre}")
+    return {"job_id": job_id, "status": "processing"}
+
+
+# ── Módulo 2 asíncrono ──
+
+def _procesar_modulo2(job_id: str, respuestas: dict, contexto_previo: str, email: str, arquetipo_corto: str):
+    try:
+        documento = generate_modulo2_gemini(respuestas, contexto_previo)
+        pdf_bytes = generate_pdf_branded(
+            content=documento,
+            titulo="Documento Maestro de Marca — Modulo 2",
+            subtitulo="Programa Anti-Inercia de Marca Personal  |  yosoyelruso.com",
+            nombre_archivo="documento-maestro-marca-modulo-2.pdf"
+        )
+        completar_job(job_id, pdf_bytes, "documento-maestro-marca-modulo-2.pdf")
+        try:
+            save_programa_lead(email, 2, {"arquetipo": arquetipo_corto})
+        except Exception as e:
+            print(f"Error registrando actividad M2: {e}")
+    except Exception as e:
+        print(f"Error procesando M2 job {job_id}: {e}")
+        fallar_job(job_id, str(e))
+
+
+@app.post("/programa/modulo2/iniciar")
+async def iniciar_modulo2(
+    background_tasks: BackgroundTasks,
+    email: str = Form(...),
+    problema_raiz: str = Form(...), raiz_explicacion: str = Form(...),
+    p1_problema: str = Form(...), p1_palabras_cliente: str = Form(...),
+    p2_quien: str = Form(...), p2_urgencia: str = Form(...),
+    p3_diferente: str = Form(...), p3_evidencia: str = Form(...),
+    p4_estilo: str = Form(...), p4_frases_si: str = Form(...),
+    p4_frases_no: str = Form(...), p4_palabras_propias: str = Form(...),
+    p4_palabras_rechazo: str = Form(...),
+    p5_enemigo: str = Form(...), p5_dano: str = Form(...),
+    arquetipo: str = Form(...), arquetipo_validacion: str = Form(...),
+    arquetipo_ajuste: str = Form(default=""),
+    val_sin_vacias: str = Form(...), val_cliente_reconoce: str = Form(...),
+    val_enemigo: str = Form(...), val_diferenciador: str = Form(...),
+    pdf_m0: UploadFile = File(...),
+    pdf_m1: UploadFile = File(...)
+):
+    if not check_email_access(email):
+        raise HTTPException(status_code=403, detail="Este correo no tiene acceso al programa.")
+
+    texto_m0 = extract_text_from_pdf(await pdf_m0.read())
+    texto_m1 = extract_text_from_pdf(await pdf_m1.read())
+    contexto_previo = f"=== MÓDULO 0 ===\n{texto_m0}\n\n=== MÓDULO 1 ===\n{texto_m1}"
+
+    job_id = str(uuid.uuid4())
+    crear_job(job_id)
+
+    respuestas = {k: v for k, v in locals().items()
+                  if k not in ['email', 'pdf_m0', 'pdf_m1', 'contexto_previo', 'texto_m0', 'texto_m1', 'background_tasks', 'job_id']}
+
+    background_tasks.add_task(_procesar_modulo2, job_id, respuestas, contexto_previo, email, arquetipo[:100])
+    return {"job_id": job_id, "status": "processing"}
+
+
+# ── Módulo 3 asíncrono ──
+
+def _procesar_modulo3(job_id: str, respuestas: dict, contexto_previo: str, email: str, canal: str, frecuencia: str):
+    try:
+        documento = generate_modulo3_gemini(respuestas, contexto_previo)
+        pdf_bytes = generate_pdf_branded(
+            content=documento,
+            titulo="Propuesta de Estrategia — Modulo 3",
+            subtitulo="Programa Anti-Inercia de Marca Personal  |  yosoyelruso.com",
+            nombre_archivo="propuesta-estrategia-modulo-3.pdf"
+        )
+        completar_job(job_id, pdf_bytes, "propuesta-estrategia-modulo-3.pdf")
+        try:
+            save_programa_lead(email, 3, {"canal_principal": canal, "frecuencia": frecuencia})
+        except Exception as e:
+            print(f"Error registrando actividad M3: {e}")
+    except Exception as e:
+        print(f"Error procesando M3 job {job_id}: {e}")
+        fallar_job(job_id, str(e))
+
+
+@app.post("/programa/modulo3/iniciar")
+async def iniciar_modulo3(
+    background_tasks: BackgroundTasks,
+    email: str = Form(...),
+    obj_visibilidad: str = Form(...), obj_visibilidad_medicion: str = Form(...),
+    obj_credibilidad: str = Form(...), obj_credibilidad_evidencia: str = Form(...),
+    obj_conversion: str = Form(...), obj_conversion_embudo: str = Form(...),
+    pilar_a_tema: str = Form(...), pilar_a_titulos: str = Form(...), pilar_a_formato: str = Form(...),
+    pilar_b_tema: str = Form(...), pilar_b_titulos: str = Form(...), pilar_b_evidencia: str = Form(...),
+    pilar_c_tema: str = Form(...), pilar_c_titulos: str = Form(...), pilar_c_cta: str = Form(...),
+    embudo_entrada: str = Form(...), embudo_siguiente: str = Form(...), embudo_cierre: str = Form(...),
+    embudo_descripcion: str = Form(...), embudo_friccion: str = Form(...), embudo_solucion: str = Form(...),
+    nivel_tecnologico: str = Form(...), herramientas_actuales: str = Form(...),
+    herramienta_proxima: str = Form(...),
+    fase1_obstaculo: str = Form(...), fase1_necesita: str = Form(...),
+    fase2_frecuencia: str = Form(...), fase2_canal: str = Form(...), fase3_pieza: str = Form(...),
+    val_objetivos: str = Form(...), val_embudo: str = Form(...),
+    val_fase1: str = Form(...), val_bloqueo: str = Form(default=""),
+    pdf_m0: UploadFile = File(...),
+    pdf_m1: UploadFile = File(...),
+    pdf_m2: UploadFile = File(...)
+):
+    if not check_email_access(email):
+        raise HTTPException(status_code=403, detail="Este correo no tiene acceso al programa.")
+
+    texto_m0 = extract_text_from_pdf(await pdf_m0.read())
+    texto_m1 = extract_text_from_pdf(await pdf_m1.read())
+    texto_m2 = extract_text_from_pdf(await pdf_m2.read())
+    contexto_previo = f"=== MÓDULO 0 ===\n{texto_m0}\n\n=== MÓDULO 1 ===\n{texto_m1}\n\n=== MÓDULO 2 ===\n{texto_m2}"
+
+    job_id = str(uuid.uuid4())
+    crear_job(job_id)
+
+    respuestas = {k: v for k, v in locals().items()
+                  if k not in ['email', 'pdf_m0', 'pdf_m1', 'pdf_m2', 'contexto_previo',
+                                'texto_m0', 'texto_m1', 'texto_m2', 'background_tasks', 'job_id']}
+
+    background_tasks.add_task(_procesar_modulo3, job_id, respuestas, contexto_previo, email, fase2_canal, fase2_frecuencia)
+    return {"job_id": job_id, "status": "processing"}
+
+
+# ============================================================
+# FUNCIONES GENERADORAS — Módulos 4 y 5
+# ============================================================
+
+def generate_modulo4_gemini(respuestas: dict, contexto_previo: str) -> str:
+    """Genera el Sistema Operativo de Contenido (Módulo 4) usando Gemini."""
+    client = google_genai.Client(api_key=GEMINI_API_KEY)
+
+    prompt = f"""Eres el motor de análisis del Programa Anti-Inercia de Marca Personal, creado por Fedor Sawoloka.
+
+Este módulo genera el "Sistema Operativo de Contenido" — el sistema que hace que el contenido ocurra independientemente de cómo amaneciste.
+
+PRINCIPIO RECTOR: La inspiración es para los artistas. Los profesionales que construyen marca con sistema saben exactamente qué publicar, en qué formato, en qué canal y con qué propósito cada semana del año. Este módulo no enseña a crear contenido. Instala el sistema.
+
+METODOLOGÍA GOLD STANDARD:
+1. Sistema sobre tácticas: No se entrega un calendario bonito. Se entrega un sistema sostenible.
+2. Ejecutabilidad: Cada elemento debe poder implementarse esta semana, no "en algún momento".
+3. Coherencia: El sistema de contenido debe resolver directamente las inercias identificadas en módulos anteriores.
+4. Análisis sincero: El documento debe reflejar la realidad del participante, no un ideal inalcanzable.
+
+INSTRUCCIONES DE TONO:
+- Directo, práctico, sin relleno.
+- Si las plantillas de arranque están incompletas, señalarlo con claridad pero sin juzgar.
+- Formato: ## para secciones, ### para subsecciones.
+- NO uses emojis ni símbolos decorativos.
+
+ESTRUCTURA OBLIGATORIA — SISTEMA OPERATIVO DE CONTENIDO:
+
+## Arquitectura de Contenido Semanal
+Análisis de la estructura de publicación declarada por el participante. ¿Es sostenible? ¿La distribución de pilares tiene lógica estratégica? Recomendaciones específicas basadas en su contexto real.
+
+## Banco de Ideas y Hooks
+Evaluación de los 6 hooks generados. ¿Activan realmente el dolor del cliente ideal? ¿Cuáles son los más potentes y por qué? Las 12 ideas del banco con análisis de cuáles tienen mayor potencial de tracción.
+
+## Protocolo de Reciclaje
+Análisis de la idea elegida y los 5 formatos. ¿La secuencia propuesta tiene lógica? Recomendaciones para maximizar el alcance de cada formato.
+
+## Las 3 Plantillas de Arranque
+Evaluación de las 3 plantillas completadas por el participante. Para cada una:
+- Qué funciona bien
+- Qué mejorar antes de publicar
+- Una sugerencia concreta de ajuste
+
+Si alguna plantilla está incompleta: señalarlo directamente y explicar por qué es el único criterio de completitud de este módulo.
+
+## Protocolo de Contingencia
+Qué hacer cuando una semana no hay tiempo para producir contenido nuevo. Plan concreto basado en el banco de ideas ya construido.
+
+## Validación del Sistema
+Evaluación honesta: ¿Este sistema es sostenible para este participante específico con sus recursos declarados? ¿Qué ajustar antes de activar?
+
+## Lo que viene: Módulo 5
+Qué construirán en el Plan de Arranque y por qué este Sistema Operativo es la base que lo hace posible.
+
+---
+Documento generado por el Programa Anti-Inercia de Marca Personal | Metodologia de Fedor Sawoloka | yosoyelruso.com
+
+CONTEXTO DE MÓDULOS ANTERIORES:
+{contexto_previo[:5000] if contexto_previo else 'No disponible'}
+
+RESPUESTAS DEL MÓDULO 4:
+
+PARTE 1 — ARQUITECTURA SEMANAL:
+- Días de publicación por semana: {respuestas.get('dias_publicacion', 'No respondido')}
+- Distribución de pilares por día: {respuestas.get('distribucion_pilares', 'No respondido')}
+- Razón de la distribución: {respuestas.get('razon_distribucion', 'No respondido')}
+- ¿Tiene día fijo de producción?: {respuestas.get('dia_produccion_tipo', 'No respondido')}
+- Día de producción (si aplica): {respuestas.get('dia_produccion', 'No respondido')}
+
+PARTE 2 — BANCO DE IDEAS Y HOOKS:
+- Dolor 1: {respuestas.get('dolor1', 'No respondido')}
+- Dolor 2: {respuestas.get('dolor2', 'No respondido')}
+- Dolor 3: {respuestas.get('dolor3', 'No respondido')}
+- Hook D1-A: {respuestas.get('hook_d1a', 'No respondido')}
+- Hook D1-B: {respuestas.get('hook_d1b', 'No respondido')}
+- Hook D2-A: {respuestas.get('hook_d2a', 'No respondido')}
+- Hook D2-B: {respuestas.get('hook_d2b', 'No respondido')}
+- Hook D3-A: {respuestas.get('hook_d3a', 'No respondido')}
+- Hook D3-B: {respuestas.get('hook_d3b', 'No respondido')}
+- Hook que publicaría primero y por qué: {respuestas.get('hook_primero', 'No respondido')}
+- Ideas Pilar Atracción (4 ideas): {respuestas.get('ideas_atraccion', 'No respondido')}
+- Ideas Pilar Autoridad (4 ideas): {respuestas.get('ideas_autoridad', 'No respondido')}
+- Ideas Pilar Conversión (4 ideas): {respuestas.get('ideas_conversion', 'No respondido')}
+
+PARTE 3 — PROTOCOLO DE RECICLAJE:
+- Idea más sólida elegida: {respuestas.get('idea_solida', 'No respondido')}
+- Formato 1 (post texto largo): {respuestas.get('formato1', 'No respondido')}
+- Formato 2 (carrusel/infografía): {respuestas.get('formato2', 'No respondido')}
+- Formato 3 (video corto/reel): {respuestas.get('formato3', 'No respondido')}
+- Formato 4 (historia/caso de estudio): {respuestas.get('formato4', 'No respondido')}
+- Formato 5 (pregunta/encuesta): {respuestas.get('formato5', 'No respondido')}
+- Orden de publicación y razón: {respuestas.get('orden_formatos', 'No respondido')}
+
+PARTE 4 — PLANTILLAS DE ARRANQUE:
+Plantilla 1 (Post de Posicionamiento):
+- Hook: {respuestas.get('p1_hook', 'No respondido')}
+- Desarrollo: {respuestas.get('p1_desarrollo', 'No respondido')}
+- Punto de vista: {respuestas.get('p1_punto_vista', 'No respondido')}
+- Cierre: {respuestas.get('p1_cierre', 'No respondido')}
+
+Plantilla 2 (Historia de Origen):
+- Momento antes: {respuestas.get('p2_antes', 'No respondido')}
+- El quiebre: {respuestas.get('p2_quiebre', 'No respondido')}
+- El después: {respuestas.get('p2_despues', 'No respondido')}
+- La conexión: {respuestas.get('p2_conexion', 'No respondido')}
+
+Plantilla 3 (Prueba Social Estratégica):
+- Punto de partida del cliente: {respuestas.get('p3_inicio', 'No respondido')}
+- El proceso: {respuestas.get('p3_proceso', 'No respondido')}
+- El resultado específico: {respuestas.get('p3_resultado', 'No respondido')}
+- La lección: {respuestas.get('p3_leccion', 'No respondido')}
+
+PARTE 5 — VALIDACIÓN:
+- ¿Sistema sostenible en semana difícil?: {respuestas.get('val_sostenible', 'No respondido')}
+- ¿Las 3 plantillas están listas para publicar?: {respuestas.get('val_plantillas', 'No respondido')}
+- Protocolo de contingencia: {respuestas.get('protocolo_contingencia', 'No respondido')}
+- ¿Herramientas de producción definidas?: {respuestas.get('val_herramientas', 'No respondido')}
+"""
+
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=prompt
+    )
+    return response.text
+
+
+def generate_modulo5_gemini(respuestas: dict, contexto_previo: str) -> str:
+    """Genera el Plan de Arranque Anti-Inercia (Módulo 5) usando Gemini."""
+    client = google_genai.Client(api_key=GEMINI_API_KEY)
+
+    prompt = f"""Eres el motor de análisis del Programa Anti-Inercia de Marca Personal, creado por Fedor Sawoloka.
+
+Este módulo genera el "Plan de Arranque Anti-Inercia" — el documento final del programa. Es el entregable más importante y el que el participante usará como brújula durante sus primeros 30 días.
+
+ADVERTENCIA CRÍTICA: Este documento debe ser el más personalizado de todos. Tiene acceso al contexto completo de los 5 módulos anteriores. No hay excusa para generar algo genérico. Cada sección debe estar calibrada a la realidad específica de este participante.
+
+METODOLOGÍA GOLD STANDARD — PRINCIPIOS PARA EL DOCUMENTO FINAL:
+1. Ejecutabilidad máxima: Cada tarea debe tener verbo, fecha y criterio de éxito. No objetivos. Tareas.
+2. Coherencia total: El plan debe resolver directamente las inercias identificadas en el Módulo 0 y 1.
+3. Calibración real: El plan debe ser operable con los recursos declarados (tiempo, presupuesto, nivel tecnológico), no con los ideales.
+4. Sistema completo: Incluye protocolos de ajuste para cuando algo no funcione.
+
+INSTRUCCIONES DE TONO:
+- Este es el cierre del programa. El tono debe ser motivador pero realista. No inspiracional vacío.
+- Directo, específico, accionable.
+- Formato: ## para secciones, ### para subsecciones.
+- NO uses emojis ni símbolos decorativos.
+
+ESTRUCTURA OBLIGATORIA — PLAN DE ARRANQUE ANTI-INERCIA:
+
+## Resumen Ejecutivo de Marca Personal
+Síntesis de una página del Arquetipo Ganador, cliente ideal, diferenciador y Enemigo Común. El espejo de quién es como profesional con marca. Basado en el Documento Maestro del Módulo 2.
+
+## Sus 3 Inercias Críticas y Cómo el Plan las Contrarresta
+Conexión directa entre lo que lo ha frenado hasta hoy (identificado en Módulos 0 y 1) y las acciones concretas del plan que rompen cada patrón. Para cada inercia: la acción específica que la contrarresta.
+
+## Plan de Acción Semana a Semana — Primeros 30 Días
+4 semanas con tareas específicas, calibradas a:
+- Frecuencia de publicación declarada en Módulo 5
+- Canal elegido en Módulo 5
+- Recursos disponibles (tiempo, presupuesto, nivel tecnológico)
+- Las 3 plantillas de arranque del Módulo 4
+
+Cada semana: tareas con verbo y criterio de éxito. No objetivos. Tareas.
+
+### Semana 1 — Preparación
+### Semana 2 — Activación
+### Semana 3 — Autoridad
+### Semana 4 — Evaluación y ajuste
+
+## Las 3 Métricas que Debe Revisar
+Explicación paso a paso de cómo acceder a cada métrica en su plataforma principal. Sin asumir conocimiento técnico previo. Calibradas al canal elegido y nivel tecnológico declarado.
+
+## Protocolo de Ajuste — Los 3 Escenarios
+Para consultar cuando algo no funcione:
+### Escenario A: El alcance no crece
+Qué revisar y qué cambiar.
+### Escenario B: El alcance crece pero no llegan contactos
+Qué revisar y qué cambiar.
+### Escenario C: Llegan contactos pero no cierra
+Qué revisar y qué cambiar.
+
+## Su Primera Publicación Estructurada
+La pieza declarada en el Módulo 5, construida con el hook, el desarrollo y el cierre. El sistema no la inventa. La construye con el contenido que el participante ya definió en sus módulos anteriores.
+
+## Propuesta de Colaboración
+Cómo la Asesoría Estratégica Continua con Fedor Sawoloka puede acelerar la implementación de este plan. Qué incluye, qué resuelve y cómo dar el siguiente paso: https://wa.link/mn6wcr
+
+---
+Documento generado por el Programa Anti-Inercia de Marca Personal | Metodologia de Fedor Sawoloka | yosoyelruso.com
+
+CONTEXTO COMPLETO DE LOS 5 MÓDULOS ANTERIORES:
+{contexto_previo[:6000] if contexto_previo else 'No disponible'}
+
+RESPUESTAS DEL MÓDULO 5:
+
+PARTE 1 — PUNTO DE PARTIDA REAL:
+- ¿Cuándo puede comenzar a ejecutar?: {respuestas.get('cuando_arrancar', 'No respondido')}
+- Qué necesita resolver antes (si aplica): {respuestas.get('que_resolver', 'No respondido')}
+- Horas reales disponibles esta semana: {respuestas.get('horas_reales', 'No respondido')}
+- Canal donde tiene más presencia hoy: {respuestas.get('canal_actual', 'No respondido')}
+- ¿Tiene alguna pieza de contenido lista?: {respuestas.get('pieza_lista', 'No respondido')}
+
+PARTE 2 — FRICCIONES PARA ARRANCAR:
+- Situación más probable que lo frene: {respuestas.get('friccion_principal', 'No respondido')}
+- Descripción de la fricción (si aplica): {respuestas.get('friccion_descripcion', 'No respondido')}
+- ¿Con qué frecuencia abandona proyectos antes de 30 días?: {respuestas.get('patron_abandono', 'No respondido')}
+- Qué necesitaría ver en las primeras 2 semanas para saber que va bien: {respuestas.get('senal_progreso', 'No respondido')}
+
+PARTE 3 — RECURSOS REALES:
+- ¿Tiene herramienta de diseño?: {respuestas.get('herramienta_diseno', 'No respondido')}
+- ¿Puede grabar video?: {respuestas.get('puede_grabar', 'No respondido')}
+- ¿Tiene espacio/momento fijo para producción?: {respuestas.get('momento_produccion', 'No respondido')}
+- Día y hora de producción (si aplica): {respuestas.get('dia_hora_produccion', 'No respondido')}
+- Presupuesto para los primeros 30 días: {respuestas.get('presupuesto_30dias', 'No respondido')}
+
+PARTE 4 — COMPROMISOS DE ARRANQUE:
+- Frecuencia de publicación comprometida: {respuestas.get('frecuencia_comprometida', 'No respondido')}
+- Canal de concentración 100%: {respuestas.get('canal_100', 'No respondido')}
+- Primera pieza de contenido (tema + formato): {respuestas.get('primera_pieza', 'No respondido')}
+- Fecha de publicación de la primera pieza: {respuestas.get('fecha_primera_pieza', 'No respondido')}
+- ¿Tiene persona de rendición de cuentas?: {respuestas.get('accountability', 'No respondido')}
+- Quién es y qué le dirá: {respuestas.get('accountability_detalle', 'No respondido')}
+
+PARTE 5 — DUDAS Y RESULTADO ESPERADO:
+- Dudas pendientes (si las hay): {respuestas.get('dudas_pendientes', 'No respondido')}
+- Resultado específico en 30 días que justificaría la inversión: {respuestas.get('resultado_30dias', 'No respondido')}
+"""
+
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=prompt
+    )
+    return response.text
+
+
+# ── Módulo 4 asíncrono ──
+
+def _procesar_modulo4(job_id: str, respuestas: dict, contexto_previo: str, email: str):
+    try:
+        documento = generate_modulo4_gemini(respuestas, contexto_previo)
+        pdf_bytes = generate_pdf_branded(
+            content=documento,
+            titulo="Sistema Operativo de Contenido — Modulo 4",
+            subtitulo="Programa Anti-Inercia de Marca Personal  |  yosoyelruso.com",
+            nombre_archivo="sistema-operativo-contenido-modulo-4.pdf"
+        )
+        completar_job(job_id, pdf_bytes, "sistema-operativo-contenido-modulo-4.pdf")
+        try:
+            save_programa_lead(email, 4, {})
+        except Exception as e:
+            print(f"Error registrando actividad M4: {e}")
+    except Exception as e:
+        print(f"Error procesando M4 job {job_id}: {e}")
+        fallar_job(job_id, str(e))
+
+
+@app.post("/programa/modulo4/iniciar")
+async def iniciar_modulo4(
+    background_tasks: BackgroundTasks,
+    email: str = Form(...),
+    dias_publicacion: str = Form(...),
+    distribucion_pilares: str = Form(...),
+    razon_distribucion: str = Form(...),
+    dia_produccion_tipo: str = Form(...),
+    dia_produccion: str = Form(default=""),
+    dolor1: str = Form(...),
+    dolor2: str = Form(...),
+    dolor3: str = Form(...),
+    hook_d1a: str = Form(...),
+    hook_d1b: str = Form(...),
+    hook_d2a: str = Form(...),
+    hook_d2b: str = Form(...),
+    hook_d3a: str = Form(...),
+    hook_d3b: str = Form(...),
+    hook_primero: str = Form(...),
+    ideas_atraccion: str = Form(...),
+    ideas_autoridad: str = Form(...),
+    ideas_conversion: str = Form(...),
+    idea_solida: str = Form(...),
+    formato1: str = Form(...),
+    formato2: str = Form(...),
+    formato3: str = Form(...),
+    formato4: str = Form(...),
+    formato5: str = Form(...),
+    orden_formatos: str = Form(...),
+    p1_hook: str = Form(...),
+    p1_desarrollo: str = Form(...),
+    p1_punto_vista: str = Form(...),
+    p1_cierre: str = Form(...),
+    p2_antes: str = Form(...),
+    p2_quiebre: str = Form(...),
+    p2_despues: str = Form(...),
+    p2_conexion: str = Form(...),
+    p3_inicio: str = Form(...),
+    p3_proceso: str = Form(...),
+    p3_resultado: str = Form(...),
+    p3_leccion: str = Form(...),
+    val_sostenible: str = Form(...),
+    val_plantillas: str = Form(...),
+    protocolo_contingencia: str = Form(...),
+    val_herramientas: str = Form(...),
+    pdf_m0: UploadFile = File(...),
+    pdf_m1: UploadFile = File(...),
+    pdf_m2: UploadFile = File(...),
+    pdf_m3: UploadFile = File(...)
+):
+    if not check_email_access(email):
+        raise HTTPException(status_code=403, detail="Este correo no tiene acceso al programa.")
+
+    texto_m0 = extract_text_from_pdf(await pdf_m0.read())
+    texto_m1 = extract_text_from_pdf(await pdf_m1.read())
+    texto_m2 = extract_text_from_pdf(await pdf_m2.read())
+    texto_m3 = extract_text_from_pdf(await pdf_m3.read())
+    contexto_previo = f"=== M0 ===\n{texto_m0}\n\n=== M1 ===\n{texto_m1}\n\n=== M2 ===\n{texto_m2}\n\n=== M3 ===\n{texto_m3}"
+
+    job_id = str(uuid.uuid4())
+    crear_job(job_id)
+
+    respuestas = {k: v for k, v in locals().items()
+                  if k not in ['email', 'pdf_m0', 'pdf_m1', 'pdf_m2', 'pdf_m3',
+                                'contexto_previo', 'texto_m0', 'texto_m1', 'texto_m2', 'texto_m3',
+                                'background_tasks', 'job_id']}
+
+    background_tasks.add_task(_procesar_modulo4, job_id, respuestas, contexto_previo, email)
+    return {"job_id": job_id, "status": "processing"}
+
+
+# ── Módulo 5 asíncrono ──
+
+def _procesar_modulo5(job_id: str, respuestas: dict, contexto_previo: str, email: str):
+    try:
+        documento = generate_modulo5_gemini(respuestas, contexto_previo)
+        pdf_bytes = generate_pdf_branded(
+            content=documento,
+            titulo="Plan de Arranque Anti-Inercia — Modulo 5",
+            subtitulo="Programa Anti-Inercia de Marca Personal  |  yosoyelruso.com",
+            nombre_archivo="plan-arranque-anti-inercia-modulo-5.pdf"
+        )
+        completar_job(job_id, pdf_bytes, "plan-arranque-anti-inercia-modulo-5.pdf")
+        try:
+            save_programa_lead(email, 5, {"fecha_arranque": respuestas.get("cuando_arrancar", "")})
+        except Exception as e:
+            print(f"Error registrando actividad M5: {e}")
+    except Exception as e:
+        print(f"Error procesando M5 job {job_id}: {e}")
+        fallar_job(job_id, str(e))
+
+
+@app.post("/programa/modulo5/iniciar")
+async def iniciar_modulo5(
+    background_tasks: BackgroundTasks,
+    email: str = Form(...),
+    cuando_arrancar: str = Form(...),
+    que_resolver: str = Form(default=""),
+    horas_reales: str = Form(...),
+    canal_actual: str = Form(...),
+    pieza_lista: str = Form(...),
+    friccion_principal: str = Form(...),
+    friccion_descripcion: str = Form(default=""),
+    patron_abandono: str = Form(...),
+    senal_progreso: str = Form(...),
+    herramienta_diseno: str = Form(...),
+    puede_grabar: str = Form(...),
+    momento_produccion: str = Form(...),
+    dia_hora_produccion: str = Form(default=""),
+    presupuesto_30dias: str = Form(...),
+    frecuencia_comprometida: str = Form(...),
+    canal_100: str = Form(...),
+    primera_pieza: str = Form(...),
+    fecha_primera_pieza: str = Form(...),
+    accountability: str = Form(...),
+    accountability_detalle: str = Form(default=""),
+    dudas_pendientes: str = Form(default=""),
+    resultado_30dias: str = Form(...),
+    pdf_m0: UploadFile = File(...),
+    pdf_m1: UploadFile = File(...),
+    pdf_m2: UploadFile = File(...),
+    pdf_m3: UploadFile = File(...),
+    pdf_m4: UploadFile = File(...)
+):
+    if not check_email_access(email):
+        raise HTTPException(status_code=403, detail="Este correo no tiene acceso al programa.")
+
+    texto_m0 = extract_text_from_pdf(await pdf_m0.read())
+    texto_m1 = extract_text_from_pdf(await pdf_m1.read())
+    texto_m2 = extract_text_from_pdf(await pdf_m2.read())
+    texto_m3 = extract_text_from_pdf(await pdf_m3.read())
+    texto_m4 = extract_text_from_pdf(await pdf_m4.read())
+    contexto_previo = f"=== M0 ===\n{texto_m0}\n\n=== M1 ===\n{texto_m1}\n\n=== M2 ===\n{texto_m2}\n\n=== M3 ===\n{texto_m3}\n\n=== M4 ===\n{texto_m4}"
+
+    job_id = str(uuid.uuid4())
+    crear_job(job_id)
+
+    respuestas = {k: v for k, v in locals().items()
+                  if k not in ['email', 'pdf_m0', 'pdf_m1', 'pdf_m2', 'pdf_m3', 'pdf_m4',
+                                'contexto_previo', 'texto_m0', 'texto_m1', 'texto_m2', 'texto_m3', 'texto_m4',
+                                'background_tasks', 'job_id']}
+
+    background_tasks.add_task(_procesar_modulo5, job_id, respuestas, contexto_previo, email)
+    return {"job_id": job_id, "status": "processing"}

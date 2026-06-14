@@ -2153,7 +2153,25 @@ ESTRUCTURA OBLIGATORIA — SISTEMA OPERATIVO DE CONTENIDO:
 Análisis de la estructura de publicación declarada por el participante. ¿Es sostenible? ¿La distribución de pilares tiene lógica estratégica? Recomendaciones específicas basadas en su contexto real.
 
 ## Banco de Ideas y Hooks
-Evaluación de los 6 hooks generados. ¿Activan realmente el dolor del cliente ideal? ¿Cuáles son los más potentes y por qué? Las 12 ideas del banco con análisis de cuáles tienen mayor potencial de tracción.
+Evaluación de los 6 hooks generados. ¿Activan realmente el dolor del cliente ideal? ¿Cuáles son los más potentes y por qué? Análisis de las 12 ideas del banco con evaluación de potencial de tracción.
+
+## Guía de Contenido Completa
+Esta sección es el activo más valioso del documento. Reproduce TEXTUALMENTE y de forma COMPLETA cada una de las 9 ideas del banco de contenido tal como las escribió el participante. NO resumas, NO parafrasees, NO omitas ningún elemento. El participante invirtió tiempo y creatividad en desarrollarlas y este documento es su guía de ejecución.
+
+Para cada idea usa exactamente esta estructura:
+
+### [Pilar] — Idea [N]: [Título o tema de la idea]
+**Hook:** [Texto exacto del hook]
+**Desarrollo / Contenido:** [Texto exacto del desarrollo]
+**Cierre / CTA:** [Texto exacto del cierre]
+**Formato:** [Formato declarado]
+
+Organiza las 9 ideas en 3 grupos:
+- Pilar Atracción: Ideas 1 a 3 (o las que correspondan)
+- Pilar Autoridad: Ideas siguientes
+- Pilar Conversión: Ideas restantes
+
+Si alguna idea tiene información incompleta (falta hook, desarrollo o cierre), indícalo con una nota breve al final de esa idea: "Nota: [elemento faltante] pendiente de completar."
 
 ## Protocolo de Reciclaje
 Análisis de la idea elegida y los 5 formatos. ¿La secuencia propuesta tiene lógica? Recomendaciones para maximizar el alcance de cada formato.

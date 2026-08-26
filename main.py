@@ -2786,14 +2786,6 @@ def generate_mapa_fuga_pdf(documento: str, empresa: str) -> bytes:
             pdf.multi_cell(0, 4.8, texto.replace("**", "").replace("*", ""))
             pdf.ln(0.7)
 
-    # Pie de página: no se añade contenido adicional; solo la marca y la fecha.
-    for pagina in range(1, pdf.page_no() + 1):
-        pdf.page = pagina
-        pdf.set_y(-12)
-        pdf.set_font("Helvetica", "I", 7.5)
-        pdf.set_text_color(140, 140, 140)
-        pdf.cell(0, 6, f"Metodología Anti-Inercia de Fedor Sawoloka | yosoyelruso.com | {datetime.now().strftime('%d/%m/%Y')}", align="C")
-
     if pdf.page_no() > 2:
         raise ValueError("El diagnóstico excedió el límite de dos páginas. Reduce el contenido generado.")
     return bytes(pdf.output())

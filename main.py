@@ -9,6 +9,7 @@ import threading
 import pdfplumber
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email.mime.application import MIMEApplication
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, BackgroundTasks
@@ -2540,3 +2541,468 @@ async def iniciar_modulo5(
 
     background_tasks.add_task(_procesar_modulo5, job_id, respuestas, contexto_previo, email)
     return {"job_id": job_id, "status": "processing"}
+
+
+# ============================================================
+# LEAD MAGNET — MAPA DE FUGA COMERCIAL
+# ============================================================
+# Flujo: formulario público -> trabajo asíncrono -> Gemini -> PDF (máx. 2 páginas)
+# -> Google Sheets + Mailchimp -> correo con PDF adjunto.
+
+class MapaFugaRequest(BaseModel):
+    nombre: str
+    email: EmailStr
+    whatsapp: str
+    empresa: str
+    sector: str
+    consentimiento: bool = False
+    q1_respuesta: str
+    q2_cac: str
+    q3_clientes: str
+    q4_capacidad: str
+    q5_previsibilidad: str
+    q6_seguimiento: str
+    q7_redes: str
+    q8_propuesta_valor: str
+    q9_marketing_ventas: str
+    q10_rentabilidad: str
+    utm_source: Optional[str] = ""
+    utm_medium: Optional[str] = ""
+    utm_campaign: Optional[str] = ""
+
+
+MAPA_FUGA_PREGUNTAS = {
+    "q1_respuesta": "Velocidad de respuesta a prospectos",
+    "q2_cac": "Medición del costo de adquisición (CAC)",
+    "q3_clientes": "Gestión de información de clientes y prospectos",
+    "q4_capacidad": "Capacidad operativa ante un aumento de demanda",
+    "q5_previsibilidad": "Previsibilidad de clientes nuevos",
+    "q6_seguimiento": "Disciplina de seguimiento de cotizaciones",
+    "q7_redes": "Comprensión del papel de redes y contenido",
+    "q8_propuesta_valor": "Claridad de propuesta de valor",
+    "q9_marketing_ventas": "Conexión entre marketing y ventas",
+    "q10_rentabilidad": "Medición de rentabilidad por canal",
+}
+
+MAPA_FUGA_BLOQUES = {
+    "Respuesta y seguimiento": ["q1_respuesta", "q6_seguimiento"],
+    "Datos y rentabilidad": ["q2_cac", "q10_rentabilidad"],
+    "Orden comercial": ["q3_clientes", "q4_capacidad", "q9_marketing_ventas"],
+    "Previsibilidad de demanda": ["q5_previsibilidad"],
+    "Oferta y enfoque": ["q7_redes", "q8_propuesta_valor"],
+}
+
+MAPA_FUGA_DESCRIPCIONES = {
+    "Respuesta y seguimiento": "La demanda llega, pero se enfría o se abandona antes de convertirse en conversación comercial.",
+    "Datos y rentabilidad": "La empresa invierte y toma decisiones sin trazabilidad suficiente sobre el retorno que genera cada canal.",
+    "Orden comercial": "Los contactos, responsables y procesos no operan como un sistema; las oportunidades pueden perderse entre personas y herramientas.",
+    "Previsibilidad de demanda": "La venta depende demasiado de recomendaciones, clientes anteriores o circunstancias que no se pueden controlar ni escalar.",
+    "Oferta y enfoque": "La empresa puede estar comunicando actividad, pero no una diferencia clara ni una ruta que conecte visibilidad con ventas.",
+}
+
+
+def normalizar_respuesta_mapa(valor: str) -> str:
+    """Acepta a/b/c, A/B/C o textos provenientes del formulario y devuelve a, b o c."""
+    texto = (valor or "").strip().lower()
+    if texto.startswith("a"):
+        return "a"
+    if texto.startswith("b"):
+        return "b"
+    if texto.startswith("c"):
+        return "c"
+    return "c"
+
+
+def clasificar_mapa_fuga(data: MapaFugaRequest) -> dict:
+    puntos_por_respuesta = {"a": 0, "b": 1, "c": 2}
+    respuestas = {campo: normalizar_respuesta_mapa(getattr(data, campo)) for campo in MAPA_FUGA_PREGUNTAS}
+    puntaje_total = sum(puntos_por_respuesta[r] for r in respuestas.values())
+
+    puntajes_bloque = {
+        bloque: sum(puntos_por_respuesta[respuestas[campo]] for campo in campos)
+        for bloque, campos in MAPA_FUGA_BLOQUES.items()
+    }
+    orden_bloques = sorted(
+        puntajes_bloque.items(),
+        key=lambda item: (item[1], len(MAPA_FUGA_BLOQUES[item[0]])),
+        reverse=True,
+    )
+    fuga_principal = orden_bloques[0][0]
+    secundarias = [item[0] for item in orden_bloques[1:3] if item[1] > 0]
+
+    if puntaje_total <= 3:
+        nivel = "Sistema bajo control"
+        prioridad = "Consolidar la disciplina de medición y prevenir que las fricciones puntuales se conviertan en inercias."
+    elif puntaje_total <= 7:
+        nivel = "Fricción en crecimiento"
+        prioridad = "Ordenar el bloque que concentra más fricción antes de que la pérdida de oportunidades se vuelva habitual."
+    elif puntaje_total <= 12:
+        nivel = "Sistema comercial vulnerable"
+        prioridad = "Priorizar el rediseño del proceso comercial; hay señales de fuga que ya limitan el aprovechamiento de la demanda."
+    else:
+        nivel = "Fuga comercial crítica"
+        prioridad = "Detener la pérdida de oportunidades con una intervención estructurada antes de invertir más presupuesto o intentar escalar."
+
+    return {
+        "respuestas_normalizadas": respuestas,
+        "puntaje_total": puntaje_total,
+        "puntajes_bloque": puntajes_bloque,
+        "fuga_principal": fuga_principal,
+        "fugas_secundarias": secundarias,
+        "nivel": nivel,
+        "prioridad": prioridad,
+    }
+
+
+def generate_mapa_fuga_gemini(data: MapaFugaRequest, clasificacion: dict) -> str:
+    """Genera un diagnóstico breve y personalizado, deliberadamente limitado para no sustituir una Auditoría 45D."""
+    client = google_genai.Client(api_key=GEMINI_API_KEY)
+    respuestas_legibles = "\n".join(
+        f"- {pregunta}: opción {clasificacion['respuestas_normalizadas'][campo].upper()}"
+        for campo, pregunta in MAPA_FUGA_PREGUNTAS.items()
+    )
+    secundarias = ", ".join(clasificacion["fugas_secundarias"]) if clasificacion["fugas_secundarias"] else "Sin fugas secundarias relevantes"
+
+    prompt = f"""Eres un consultor estratégico que aplica la metodología Anti-Inercia de Fedor Sawoloka.
+
+Genera el "Mapa de Fuga Comercial" de {data.nombre}, de la empresa {data.empresa} ({data.sector}). Este es un lead magnet gratuito: debe ser honesto, útil y específico, pero NO debe sustituir una Auditoría Estratégica 45D ni entregar un plan completo de implementación.
+
+DATOS CALCULADOS DEL SISTEMA:
+- Puntaje total: {clasificacion['puntaje_total']} de 20
+- Nivel: {clasificacion['nivel']}
+- Fuga principal: {clasificacion['fuga_principal']}
+- Lectura de esa fuga: {MAPA_FUGA_DESCRIPCIONES[clasificacion['fuga_principal']]}
+- Fugas secundarias: {secundarias}
+- Prioridad calculada: {clasificacion['prioridad']}
+
+RESPUESTAS DEL USUARIO:
+{respuestas_legibles}
+
+INSTRUCCIONES OBLIGATORIAS:
+- Escribe en español latinoamericano, tono directo, profesional y respetuoso.
+- Usa el nombre de la empresa cuando encaje naturalmente.
+- No inventes cifras, ingresos, pérdidas monetarias ni datos que el usuario no proporcionó.
+- No uses emojis ni frases de autoayuda.
+- Máximo 360 palabras de contenido total para asegurar que el PDF no exceda dos páginas.
+- El diagnóstico debe confrontar la realidad con respeto: abrir los ojos, no humillar.
+- Ofrece solo UNA prioridad inicial de bajo riesgo; no conviertas el resultado en una lista de tácticas.
+- Explica con claridad que el mapa identifica dónde se está frenando el sistema, mientras la Auditoría 45D investiga causas, responsables, indicadores y plan de corrección.
+- Utiliza exactamente la siguiente estructura Markdown:
+
+# Tu Mapa de Fuga Comercial
+## Resultado principal
+Indica el nivel y la fuga dominante en una frase clara.
+
+## Lo que tus respuestas revelan
+Incluye 2 o 3 evidencias específicas basadas en las respuestas A/B/C, explicadas en lenguaje de negocio.
+
+## El riesgo de mantener esta inercia
+Explica la consecuencia operativa o comercial probable sin inventar números.
+
+## Tu primera prioridad
+Una acción concreta de observación, orden o medición para los próximos 7 días.
+
+## El siguiente paso
+Incluye exactamente esta idea, adaptada con naturalidad: "Este mapa identifica dónde se está frenando tu sistema comercial. Corregirlo exige analizar causas, responsables, procesos e indicadores. Ese es el trabajo de la Auditoría Estratégica 45D." Cierra invitando a aplicar en https://yosoyelruso.com/auditoria-45d.html
+
+---
+Mapa de Fuga Comercial | Metodología Anti-Inercia de Fedor Sawoloka | yosoyelruso.com
+"""
+    response = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
+    return response.text
+
+
+def generate_mapa_fuga_fallback(data: MapaFugaRequest, clasificacion: dict) -> str:
+    """Respuesta controlada si Gemini no está disponible; conserva valor y no revela tácticas extensas."""
+    evidencias = []
+    for campo, respuesta in clasificacion["respuestas_normalizadas"].items():
+        if respuesta in ["b", "c"]:
+            evidencias.append(MAPA_FUGA_PREGUNTAS[campo])
+        if len(evidencias) == 3:
+            break
+    evidencia_texto = ", ".join(evidencias) if evidencias else "algunas áreas puntuales de tu sistema comercial"
+    return f"""# Tu Mapa de Fuga Comercial
+
+## Resultado principal
+Tu nivel actual es: {clasificacion['nivel']}. La fuga dominante se concentra en {clasificacion['fuga_principal']}.
+
+## Lo que tus respuestas revelan
+Tus respuestas muestran señales de fricción en {evidencia_texto}. {MAPA_FUGA_DESCRIPCIONES[clasificacion['fuga_principal']]}
+
+## El riesgo de mantener esta inercia
+Cuando esta fuga no se mide ni se ordena, la empresa puede seguir generando actividad sin convertirla de manera consistente en oportunidades comerciales aprovechables.
+
+## Tu primera prioridad
+Durante los próximos 7 días, registra de forma simple qué ocurre con cada prospecto que llega: origen, responsable, tiempo de respuesta y siguiente acción. No intentes cambiar todo todavía; primero haz visible el recorrido real.
+
+## El siguiente paso
+Este mapa identifica dónde se está frenando tu sistema comercial. Corregirlo exige analizar causas, responsables, procesos e indicadores. Ese es el trabajo de la Auditoría Estratégica 45D. Conoce el servicio en https://yosoyelruso.com/auditoria-45d.html
+
+---
+Mapa de Fuga Comercial | Metodología Anti-Inercia de Fedor Sawoloka | yosoyelruso.com
+"""
+
+
+def generate_mapa_fuga_pdf(documento: str, empresa: str) -> bytes:
+    """Genera un PDF visualmente consistente y limitado a dos páginas para el lead magnet."""
+    documento = limpiar_para_pdf(documento)
+    empresa = limpiar_para_pdf(empresa)
+    pdf = FPDF(orientation="P", unit="mm", format="A4")
+    pdf.set_auto_page_break(auto=True, margin=18)
+    pdf.set_margins(16, 18, 16)
+    pdf.add_page()
+
+    pdf.set_fill_color(44, 62, 80)
+    pdf.rect(0, 0, 210, 30, "F")
+    pdf.set_text_color(255, 255, 255)
+    pdf.set_font("Helvetica", "B", 15)
+    pdf.set_xy(16, 7)
+    pdf.cell(0, 8, "Tu Mapa de Fuga Comercial", ln=True)
+    pdf.set_font("Helvetica", "", 9)
+    pdf.set_text_color(255, 140, 66)
+    pdf.set_x(16)
+    pdf.cell(0, 6, empresa)
+    pdf.set_y(38)
+
+    for linea in documento.split("\n"):
+        texto = linea.strip()
+        if not texto or texto == "---":
+            pdf.ln(2)
+            continue
+        if texto.startswith("# "):
+            continue
+        if texto.startswith("## "):
+            pdf.ln(2)
+            pdf.set_font("Helvetica", "B", 12)
+            pdf.set_text_color(44, 62, 80)
+            pdf.multi_cell(0, 6, texto[3:])
+            pdf.set_draw_color(255, 140, 66)
+            pdf.set_line_width(0.45)
+            pdf.line(16, pdf.get_y(), 194, pdf.get_y())
+            pdf.ln(2)
+        else:
+            pdf.set_font("Helvetica", "", 9.5)
+            pdf.set_text_color(60, 60, 60)
+            pdf.multi_cell(0, 4.8, texto.replace("**", "").replace("*", ""))
+            pdf.ln(0.7)
+
+    # Pie de página: no se añade contenido adicional; solo la marca y la fecha.
+    for pagina in range(1, pdf.page_no() + 1):
+        pdf.page = pagina
+        pdf.set_y(-12)
+        pdf.set_font("Helvetica", "I", 7.5)
+        pdf.set_text_color(140, 140, 140)
+        pdf.cell(0, 6, f"Metodología Anti-Inercia de Fedor Sawoloka | yosoyelruso.com | {datetime.now().strftime('%d/%m/%Y')}", align="C")
+
+    if pdf.page_no() > 2:
+        raise ValueError("El diagnóstico excedió el límite de dos páginas. Reduce el contenido generado.")
+    return bytes(pdf.output())
+
+
+def get_or_create_mapa_fuga_sheet(service):
+    """Garantiza una pestaña propia para el lead magnet sin tocar las pestañas existentes."""
+    titulo = "Autodiagnostico_AntiInercia"
+    spreadsheet = service.spreadsheets().get(spreadsheetId=GOOGLE_SHEET_ID).execute()
+    hojas = {sheet["properties"]["title"] for sheet in spreadsheet.get("sheets", [])}
+    if titulo not in hojas:
+        service.spreadsheets().batchUpdate(
+            spreadsheetId=GOOGLE_SHEET_ID,
+            body={"requests": [{"addSheet": {"properties": {"title": titulo}}}]},
+        ).execute()
+    headers = [
+        "Fecha", "Nombre", "Email", "WhatsApp", "Empresa", "Sector",
+        "Q1_Respuesta", "Q2_CAC", "Q3_Clientes", "Q4_Capacidad", "Q5_Previsibilidad",
+        "Q6_Seguimiento", "Q7_Redes", "Q8_PropuestaValor", "Q9_MarketingVentas", "Q10_Rentabilidad",
+        "Puntaje", "Nivel", "Fuga_Principal", "Fugas_Secundarias", "Puntajes_por_Bloque",
+        "UTM_Source", "UTM_Medium", "UTM_Campaign", "Consentimiento", "Email_Enviado",
+    ]
+    valores = service.spreadsheets().values().get(
+        spreadsheetId=GOOGLE_SHEET_ID, range=f"{titulo}!A1:Z1"
+    ).execute().get("values", [])
+    if not valores:
+        service.spreadsheets().values().update(
+            spreadsheetId=GOOGLE_SHEET_ID,
+            range=f"{titulo}!A1:Z1",
+            valueInputOption="RAW",
+            body={"values": [headers]},
+        ).execute()
+    return titulo
+
+
+def save_mapa_fuga_to_google_sheets(data: MapaFugaRequest, clasificacion: dict, email_enviado: bool) -> bool:
+    try:
+        service = get_google_sheets_service()
+        titulo = get_or_create_mapa_fuga_sheet(service)
+        row = [
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"), data.nombre, data.email, data.whatsapp,
+            data.empresa, data.sector,
+            data.q1_respuesta, data.q2_cac, data.q3_clientes, data.q4_capacidad, data.q5_previsibilidad,
+            data.q6_seguimiento, data.q7_redes, data.q8_propuesta_valor, data.q9_marketing_ventas, data.q10_rentabilidad,
+            clasificacion["puntaje_total"], clasificacion["nivel"], clasificacion["fuga_principal"],
+            ", ".join(clasificacion["fugas_secundarias"]), json.dumps(clasificacion["puntajes_bloque"], ensure_ascii=False),
+            data.utm_source or "", data.utm_medium or "", data.utm_campaign or "",
+            "Sí" if data.consentimiento else "No", "Sí" if email_enviado else "No",
+        ]
+        service.spreadsheets().values().append(
+            spreadsheetId=GOOGLE_SHEET_ID,
+            range=f"{titulo}!A:Z",
+            valueInputOption="RAW",
+            body={"values": [row]},
+        ).execute()
+        return True
+    except Exception as e:
+        print(f"Error guardando Mapa de Fuga Comercial en Google Sheets: {e}")
+        return False
+
+
+def subscribe_mapa_fuga_mailchimp(data: MapaFugaRequest, clasificacion: dict) -> bool:
+    if not data.consentimiento:
+        return False
+    try:
+        slug_fuga = clasificacion["fuga_principal"].lower().replace(" ", "-")
+        slug_nivel = clasificacion["nivel"].lower().replace(" ", "-")
+        tags = ["mapa-fuga-comercial", f"fuga-{slug_fuga}", f"nivel-{slug_nivel}"]
+        for secundaria in clasificacion["fugas_secundarias"]:
+            tags.append(f"friccion-{secundaria.lower().replace(' ', '-')}")
+        payload = {
+            "email_address": data.email,
+            "status": "subscribed",
+            "merge_fields": {"FNAME": data.nombre.split()[0] if data.nombre else ""},
+            "tags": tags,
+        }
+        url = f"https://{MAILCHIMP_SERVER_PREFIX}.api.mailchimp.com/3.0/lists/{MAILCHIMP_LIST_ID}/members"
+        response = requests.post(url, auth=("anystring", MAILCHIMP_API_KEY), json=payload, timeout=20)
+        if response.status_code == 400 and "already a list member" in response.text:
+            import hashlib
+            email_hash = hashlib.md5(data.email.lower().encode()).hexdigest()
+            update_url = f"https://{MAILCHIMP_SERVER_PREFIX}.api.mailchimp.com/3.0/lists/{MAILCHIMP_LIST_ID}/members/{email_hash}"
+            requests.patch(update_url, auth=("anystring", MAILCHIMP_API_KEY), json={"merge_fields": payload["merge_fields"]}, timeout=20)
+            tags_url = f"{update_url}/tags"
+            requests.post(tags_url, auth=("anystring", MAILCHIMP_API_KEY), json={"tags": [{"name": tag, "status": "active"} for tag in tags]}, timeout=20)
+        return response.status_code in (200, 201, 400)
+    except Exception as e:
+        print(f"Error registrando Mapa de Fuga Comercial en Mailchimp: {e}")
+        return False
+
+
+def send_mapa_fuga_by_email(recipient_email: str, nombre: str, empresa: str, clasificacion: dict, pdf_bytes: bytes) -> bool:
+    """Envía el PDF adjunto usando el mismo canal SMTP ya activo en Configura tu IA."""
+    if not GMAIL_APP_PASSWORD:
+        print("GMAIL_APP_PASSWORD no configurado, no se puede entregar el Mapa de Fuga Comercial")
+        return False
+    try:
+        primer_nombre = nombre.strip().split()[0] if nombre and nombre.strip() else ""
+        msg = MIMEMultipart("mixed")
+        msg["Subject"] = "Tu Mapa de Fuga Comercial está listo"
+        msg["From"] = f"Fedor Sawoloka <{GMAIL_USER}>"
+        msg["To"] = recipient_email
+
+        cuerpo = MIMEMultipart("alternative")
+        texto = f"""Hola {primer_nombre},
+
+Tu Mapa de Fuga Comercial ya está listo.
+
+El diagnóstico detectó como foco principal: {clasificacion['fuga_principal']}. Adjuntamos tu PDF personalizado para que puedas revisarlo con calma.
+
+Este mapa identifica dónde se está frenando tu sistema comercial. Corregirlo exige analizar causas, responsables, procesos e indicadores. Ese es el trabajo de la Auditoría Estratégica 45D.
+
+Conoce la Auditoría 45D: https://yosoyelruso.com/auditoria-45d.html
+
+Fedor Sawoloka
+Estrategia Anti-Inercia
+"""
+        html = f"""
+        <html><body style="font-family:Arial,sans-serif;max-width:640px;margin:0 auto;padding:20px;color:#2C3E50;">
+          <div style="background:#2C3E50;padding:22px;border-radius:8px 8px 0 0;">
+            <h1 style="margin:0;color:#fff;font-size:22px;">Tu Mapa de Fuga Comercial está listo</h1>
+            <p style="margin:7px 0 0;color:#FF8C42;">Metodología Anti-Inercia de Fedor Sawoloka</p>
+          </div>
+          <div style="background:#f6f7f8;padding:24px;border:1px solid #e1e5e8;border-radius:0 0 8px 8px;">
+            <p>Hola {primer_nombre},</p>
+            <p>Ya analizamos tus respuestas para <strong>{empresa}</strong>. Tu principal foco de atención está en <strong>{clasificacion['fuga_principal']}</strong>.</p>
+            <p>Adjunto encontrarás tu <strong>Mapa de Fuga Comercial</strong> personalizado. Léelo como un punto de partida: identifica dónde se está frenando tu sistema, pero no sustituye el análisis de causas, responsables, procesos e indicadores que requiere una intervención estratégica.</p>
+            <p style="margin:24px 0;"><a href="https://yosoyelruso.com/auditoria-45d.html" style="background:#FF8C42;color:#fff;padding:12px 18px;text-decoration:none;border-radius:6px;font-weight:bold;">Conocer la Auditoría 45D</a></p>
+            <p style="font-size:12px;color:#6c757d;">Generado en yosoyelruso.com con la metodología Anti-Inercia.</p>
+          </div>
+        </body></html>
+        """
+        cuerpo.attach(MIMEText(texto, "plain", "utf-8"))
+        cuerpo.attach(MIMEText(html, "html", "utf-8"))
+        msg.attach(cuerpo)
+        adjunto = MIMEApplication(pdf_bytes, _subtype="pdf")
+        adjunto.add_header("Content-Disposition", "attachment", filename="mapa-de-fuga-comercial.pdf")
+        msg.attach(adjunto)
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
+            server.sendmail(GMAIL_USER, recipient_email, msg.as_string())
+        print(f"Mapa de Fuga Comercial enviado exitosamente a {recipient_email}")
+        return True
+    except Exception as e:
+        print(f"Error enviando Mapa de Fuga Comercial: {e}")
+        return False
+
+
+def _procesar_mapa_fuga(job_id: str, data: MapaFugaRequest):
+    try:
+        clasificacion = clasificar_mapa_fuga(data)
+        try:
+            documento = generate_mapa_fuga_gemini(data, clasificacion)
+        except Exception as e:
+            print(f"Gemini falló en Mapa de Fuga Comercial: {e}")
+            documento = generate_mapa_fuga_fallback(data, clasificacion)
+        pdf_bytes = generate_mapa_fuga_pdf(documento, data.empresa)
+        email_enviado = send_mapa_fuga_by_email(data.email, data.nombre, data.empresa, clasificacion, pdf_bytes)
+        try:
+            save_mapa_fuga_to_google_sheets(data, clasificacion, email_enviado)
+        except Exception as e:
+            print(f"Error no crítico guardando Mapa de Fuga Comercial: {e}")
+        try:
+            subscribe_mapa_fuga_mailchimp(data, clasificacion)
+        except Exception as e:
+            print(f"Error no crítico registrando Mapa de Fuga Comercial en Mailchimp: {e}")
+        if not email_enviado:
+            raise RuntimeError("El diagnóstico fue generado, pero no pudo entregarse al correo indicado.")
+        completar_job(job_id, pdf_bytes, "mapa-de-fuga-comercial.pdf")
+        with jobs_lock:
+            if job_id in jobs:
+                jobs[job_id]["email_sent"] = True
+                jobs[job_id]["classification"] = {
+                    "nivel": clasificacion["nivel"],
+                    "fuga_principal": clasificacion["fuga_principal"],
+                }
+    except Exception as e:
+        print(f"Error procesando Mapa de Fuga Comercial {job_id}: {e}")
+        fallar_job(job_id, str(e))
+
+
+@app.post("/mapa-fuga-comercial/iniciar")
+async def iniciar_mapa_fuga(data: MapaFugaRequest, background_tasks: BackgroundTasks):
+    if not data.consentimiento:
+        raise HTTPException(status_code=400, detail="Necesitamos tu autorización para enviarte el resultado y comunicaciones estratégicas.")
+    if len(data.whatsapp.strip()) < 7:
+        raise HTTPException(status_code=400, detail="Ingresa un número de WhatsApp válido con código de país.")
+    job_id = str(uuid.uuid4())
+    crear_job(job_id)
+    background_tasks.add_task(_procesar_mapa_fuga, job_id, data)
+    return {"job_id": job_id, "status": "processing", "message": "Estamos preparando tu Mapa de Fuga Comercial."}
+
+
+@app.get("/mapa-fuga-comercial/job/{job_id}")
+def consultar_mapa_fuga_job(job_id: str):
+    limpiar_jobs_viejos()
+    with jobs_lock:
+        job = jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Trabajo no encontrado o expirado.")
+    return {
+        "job_id": job_id,
+        "status": job["status"],
+        "email_sent": job.get("email_sent", False),
+        "classification": job.get("classification"),
+        "error": job.get("error"),
+    }
+
+
+@app.get("/mapa-fuga-comercial/health")
+def health_mapa_fuga():
+    return {"status": "ready", "service": "Mapa de Fuga Comercial"}

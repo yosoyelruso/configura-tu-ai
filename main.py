@@ -2600,6 +2600,61 @@ MAPA_FUGA_DESCRIPCIONES = {
     "Oferta y enfoque": "La empresa puede estar comunicando actividad, pero no una diferencia clara ni una ruta que conecte visibilidad con ventas.",
 }
 
+# Traducción interna de las respuestas: estos textos sí pueden aparecer en el diagnóstico.
+# Las claves a/b/c jamás se exponen a la persona que recibe el PDF.
+MAPA_FUGA_EVIDENCIAS = {
+    "q1_respuesta": {
+        "a": "La respuesta a prospectos es inmediata, lo que protege el interés inicial.",
+        "b": "Las consultas pueden esperar varias horas antes de recibir respuesta.",
+        "c": "Las consultas se responden tarde o se pierden, enfriando oportunidades con intención de compra.",
+    },
+    "q2_cac": {
+        "a": "El costo de adquirir un cliente se calcula de forma periódica.",
+        "b": "Existe una estimación de adquisición, pero no una cifra exacta que guíe las decisiones.",
+        "c": "La inversión comercial se realiza sin medir con precisión cuánto cuesta adquirir cada cliente.",
+    },
+    "q3_clientes": {
+        "a": "La información de clientes y prospectos vive en un CRM actualizado.",
+        "b": "La información comercial depende de hojas que no siempre se actualizan.",
+        "c": "Los datos de clientes y prospectos están dispersos entre mensajes, agendas y herramientas personales.",
+    },
+    "q4_capacidad": {
+        "a": "La operación puede absorber un aumento de demanda sin perder control.",
+        "b": "Un aumento de demanda generaría tensión en el equipo y limitaría el seguimiento.",
+        "c": "La operación actual no podría atender un volumen mayor de oportunidades sin perder la mayoría.",
+    },
+    "q5_previsibilidad": {
+        "a": "Existen canales propios que generan clientes nuevos de forma predecible.",
+        "b": "La llegada de clientes nuevos ocurre, pero todavía es irregular.",
+        "c": "La venta depende principalmente de recomendaciones, clientes antiguos o contactos personales.",
+    },
+    "q6_seguimiento": {
+        "a": "Las cotizaciones siguen una secuencia de seguimiento definida.",
+        "b": "El seguimiento posterior a una cotización es limitado e inconsistente.",
+        "c": "Las oportunidades sin respuesta suelen abandonarse después del primer contacto.",
+    },
+    "q7_redes": {
+        "a": "El contenido se entiende como una parte conectada al sistema de ventas.",
+        "b": "El contenido puede generar interés, pero aún no se conecta bien con el proceso comercial.",
+        "c": "Se espera que publicar más contenido resuelva por sí solo el problema de ventas.",
+    },
+    "q8_propuesta_valor": {
+        "a": "La propuesta de valor es clara y consistente en los canales comerciales.",
+        "b": "La diferencia competitiva existe, pero cada integrante la comunica de forma distinta.",
+        "c": "La empresa termina compitiendo por precio o promesas generales porque su diferencia no está clara.",
+    },
+    "q9_marketing_ventas": {
+        "a": "Los prospectos generados tienen responsable, registro y seguimiento hasta la venta.",
+        "b": "El seguimiento depende en exceso del criterio individual de cada vendedor.",
+        "c": "No existe claridad consistente sobre qué ocurre con los prospectos después de que llegan.",
+    },
+    "q10_rentabilidad": {
+        "a": "Se revisan indicadores de inversión, oportunidades, ventas y rentabilidad por canal.",
+        "b": "Se observan métricas generales, pero no siempre se conectan con ventas reales.",
+        "c": "No hay una forma consistente de distinguir las acciones rentables de las que solo consumen presupuesto.",
+    },
+}
+
 
 def normalizar_respuesta_mapa(valor: str) -> str:
     """Acepta a/b/c, A/B/C o textos provenientes del formulario y devuelve a, b o c."""
@@ -2658,8 +2713,8 @@ def generate_mapa_fuga_gemini(data: MapaFugaRequest, clasificacion: dict) -> str
     """Genera un diagnóstico breve y personalizado, deliberadamente limitado para no sustituir una Auditoría 45D."""
     client = google_genai.Client(api_key=GEMINI_API_KEY)
     respuestas_legibles = "\n".join(
-        f"- {pregunta}: opción {clasificacion['respuestas_normalizadas'][campo].upper()}"
-        for campo, pregunta in MAPA_FUGA_PREGUNTAS.items()
+        f"- {MAPA_FUGA_EVIDENCIAS[campo][clasificacion['respuestas_normalizadas'][campo]]}"
+        for campo in MAPA_FUGA_PREGUNTAS
     )
     secundarias = ", ".join(clasificacion["fugas_secundarias"]) if clasificacion["fugas_secundarias"] else "Sin fugas secundarias relevantes"
 
@@ -2694,7 +2749,7 @@ INSTRUCCIONES OBLIGATORIAS:
 Indica el nivel y la fuga dominante en una frase clara.
 
 ## Lo que tus respuestas revelan
-Incluye 2 o 3 evidencias específicas basadas en las respuestas A/B/C, explicadas en lenguaje de negocio.
+Incluye 2 o 3 evidencias específicas basadas exclusivamente en las interpretaciones recibidas, explicadas en lenguaje de negocio. Nunca menciones opciones, letras, códigos internos, paréntesis como (A), (B) o (C), ni nombres técnicos de campos.
 
 ## El riesgo de mantener esta inercia
 Explica la consecuencia operativa o comercial probable sin inventar números.
@@ -2717,17 +2772,17 @@ def generate_mapa_fuga_fallback(data: MapaFugaRequest, clasificacion: dict) -> s
     evidencias = []
     for campo, respuesta in clasificacion["respuestas_normalizadas"].items():
         if respuesta in ["b", "c"]:
-            evidencias.append(MAPA_FUGA_PREGUNTAS[campo])
+            evidencias.append(MAPA_FUGA_EVIDENCIAS[campo][respuesta])
         if len(evidencias) == 3:
             break
-    evidencia_texto = ", ".join(evidencias) if evidencias else "algunas áreas puntuales de tu sistema comercial"
+    evidencia_texto = " ".join(evidencias) if evidencias else "El sistema presenta algunas áreas puntuales que conviene observar con más detalle."
     return f"""# Tu Mapa de Fuga Comercial
 
 ## Resultado principal
 Tu nivel actual es: {clasificacion['nivel']}. La fuga dominante se concentra en {clasificacion['fuga_principal']}.
 
 ## Lo que tus respuestas revelan
-Tus respuestas muestran señales de fricción en {evidencia_texto}. {MAPA_FUGA_DESCRIPCIONES[clasificacion['fuga_principal']]}
+Tus respuestas revelan lo siguiente: {evidencia_texto} {MAPA_FUGA_DESCRIPCIONES[clasificacion['fuga_principal']]}
 
 ## El riesgo de mantener esta inercia
 Cuando esta fuga no se mide ni se ordena, la empresa puede seguir generando actividad sin convertirla de manera consistente en oportunidades comerciales aprovechables.

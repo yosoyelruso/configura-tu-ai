@@ -2999,24 +2999,29 @@ def _procesar_mapa_fuga(job_id: str, data: MapaFugaRequest):
             documento = generate_mapa_fuga_fallback(data, clasificacion)
         pdf_bytes = generate_mapa_fuga_pdf(documento, data.empresa)
         email_enviado = send_mapa_fuga_by_email(data.email, data.nombre, data.empresa, clasificacion, pdf_bytes)
-        try:
-            save_mapa_fuga_to_google_sheets(data, clasificacion, email_enviado)
-        except Exception as e:
-            print(f"Error no crítico guardando Mapa de Fuga Comercial: {e}")
+        if not email_enviado:
+            raise RuntimeError("El diagnóstico fue generado, pero no pudo entregarse al correo indicado.")
+
+        # El evento Lead solo debe habilitarse si el registro se confirmó correctamente en Google Sheets.
+        lead_saved = save_mapa_fuga_to_google_sheets(data, clasificacion, email_enviado)
+        if not lead_saved:
+            raise RuntimeError("El diagnóstico fue enviado, pero no pudimos confirmar su registro. Intenta nuevamente en unos minutos.")
+
         try:
             subscribe_mapa_fuga_mailchimp(data, clasificacion)
         except Exception as e:
             print(f"Error no crítico registrando Mapa de Fuga Comercial en Mailchimp: {e}")
-        if not email_enviado:
-            raise RuntimeError("El diagnóstico fue generado, pero no pudo entregarse al correo indicado.")
-        completar_job(job_id, pdf_bytes, "mapa-de-fuga-comercial.pdf")
+
+        # Completar todos los indicadores antes de marcar el trabajo como finalizado.
         with jobs_lock:
             if job_id in jobs:
                 jobs[job_id]["email_sent"] = True
+                jobs[job_id]["lead_saved"] = True
                 jobs[job_id]["classification"] = {
                     "nivel": clasificacion["nivel"],
                     "fuga_principal": clasificacion["fuga_principal"],
                 }
+        completar_job(job_id, pdf_bytes, "mapa-de-fuga-comercial.pdf")
     except Exception as e:
         print(f"Error procesando Mapa de Fuga Comercial {job_id}: {e}")
         fallar_job(job_id, str(e))
@@ -3045,6 +3050,7 @@ def consultar_mapa_fuga_job(job_id: str):
         "job_id": job_id,
         "status": job["status"],
         "email_sent": job.get("email_sent", False),
+        "lead_saved": job.get("lead_saved", False),
         "classification": job.get("classification"),
         "error": job.get("error"),
     }

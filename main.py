@@ -6,13 +6,19 @@ import requests
 import io
 import uuid
 import threading
+import hmac
+import hashlib
+import base64
+import secrets
+import time
 import pdfplumber
+import bcrypt
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.application import MIMEApplication
 from datetime import datetime
 from typing import Optional, List, Dict, Any
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, BackgroundTasks
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, BackgroundTasks, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel, EmailStr
@@ -87,8 +93,7 @@ app.add_middleware(
         "http://yosoyelruso.com",
         "http://localhost",
         "http://localhost:8000",
-        "http://127.0.0.1:5500",
-        "*"
+        "http://127.0.0.1:5500"
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -105,6 +110,19 @@ GOOGLE_CREDENTIALS_FILE = os.getenv("GOOGLE_CREDENTIALS_FILE", "google_credentia
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
 GMAIL_USER = os.getenv("GMAIL_USER", "fedor.sawoloka@gmail.com")
 GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
+
+# Cuadro de Empatía privado. Estas variables se definen exclusivamente en Render.
+CUADRO_EMPATIA_PASSWORD_HASH = os.getenv("CUADRO_EMPATIA_PASSWORD_HASH")
+CUADRO_EMPATIA_SESSION_SECRET = os.getenv("CUADRO_EMPATIA_SESSION_SECRET")
+CUADRO_EMPATIA_SHEET_TAB = "Cuadro_Empatia"
+CUADRO_EMPATIA_WORKSPACE = "fedor_privado"
+CUADRO_EMPATIA_SESSION_COOKIE = "cuadro_empatia_session"
+CUADRO_EMPATIA_CSRF_COOKIE = "cuadro_empatia_csrf"
+CUADRO_EMPATIA_SESSION_TTL_SECONDS = 60 * 60 * 12
+CUADRO_EMPATIA_MAX_ATTEMPTS = 5
+CUADRO_EMPATIA_ATTEMPT_WINDOW_SECONDS = 15 * 60
+cuadro_empatia_access_attempts: Dict[str, List[float]] = {}
+cuadro_empatia_access_attempts_lock = threading.Lock()
 
 # ID de la hoja de cálculo para la lista de acceso del Programa Anti-Inercia
 # Usa la misma hoja principal; la lista de acceso está en la pestaña "Acceso_Programa"
@@ -3059,3 +3077,724 @@ def consultar_mapa_fuga_job(job_id: str):
 @app.get("/mapa-fuga-comercial/health")
 def health_mapa_fuga():
     return {"status": "ready", "service": "Mapa de Fuga Comercial"}
+
+
+# ============================================================
+# CUADRO DE EMPATÍA PRIVADO — Sesión, persistencia y análisis
+# ============================================================
+# La herramienta usa una pestaña privada de Google Sheets para persistir
+# cada cuadro como una unidad JSON. Nunca se registran contenidos sensibles
+# en logs y todas las rutas, salvo access, exigen sesión válida.
+
+CUADRO_EMPATIA_SYSTEM_PROMPT = """Eres el motor analítico privado del Cuadro de Empatía de Fedor Sawoloka.
+Trabajas EXCLUSIVAMENTE bajo la metodología Anti-Inercia.
+
+La metodología Anti-Inercia no produce calendarios vacíos ni recomienda publicar más por inercia. Convierte observaciones del avatar en decisiones que reducen fricción, aclaran incertidumbres y ayudan a mover una decisión real. Prioriza evidencia disponible, tensión real, costo de no actuar y la acción que el negocio puede sostener.
+
+Analiza únicamente la información entregada en el Cuadro de Empatía. No inventes datos demográficos, resultados, competidores, perfiles, certezas ni testimonios. Cuando no exista evidencia suficiente, decláralo explícitamente en evidence_gaps. No des recomendaciones genéricas de redes sociales. No nombres plataformas, formatos o tácticas si la información no las justifica.
+
+Identifica tensiones, creencias, objeciones, estímulos y comportamientos que influyen en la decisión del avatar. Luego propone líneas de contenido que sirvan para validar, aclarar, confirmar o disuadir. Cada línea debe responder a un hallazgo del cuadro y proponer una idea accionable; no debe ser un eslogan vacío.
+
+La primera decisión operativa debe ser concreta y realizable. Si el cuadro no permite sostener una conclusión, pide evidencia adicional en lugar de simular certeza.
+"""
+
+CUADRO_EMPATIA_HEADERS = [
+    "ID", "Workspace_ID", "Titulo", "Payload_JSON", "Created_At", "Updated_At"
+]
+
+class CuadroEmpatiaItem(BaseModel):
+    id: str
+    text: str
+    position: int
+
+class CuadroEmpatiaPayload(BaseModel):
+    title: str = "Cuadro sin título"
+    avatar_name: str = ""
+    avatar_context: str = ""
+    work_aspect: str = ""
+    think_feel: List[CuadroEmpatiaItem] = []
+    hear: List[CuadroEmpatiaItem] = []
+    see: List[CuadroEmpatiaItem] = []
+    do: List[CuadroEmpatiaItem] = []
+    analysis_draft: Dict[str, Any] = {}
+    analysis_versions: List[Dict[str, Any]] = []
+
+class CuadroEmpatiaAccessRequest(BaseModel):
+    password: str
+
+
+def _cuadro_now() -> str:
+    return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+
+def _cuadro_safe_text(value: Any, limit: int = 6000) -> str:
+    return str(value or "").strip()[:limit]
+
+
+def _cuadro_sanitize_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    sanitized = []
+    for index, item in enumerate(items or [], start=1):
+        text = _cuadro_safe_text(item.get("text", ""), 4000)
+        if not text:
+            continue
+        sanitized.append({
+            "id": _cuadro_safe_text(item.get("id", ""), 100) or str(uuid.uuid4()),
+            "text": text,
+            "position": index,
+        })
+    return sanitized
+
+
+def _cuadro_default_payload(cuadro_id: str, title: str = "Cuadro sin título") -> Dict[str, Any]:
+    now = _cuadro_now()
+    return {
+        "id": cuadro_id,
+        "workspace_id": CUADRO_EMPATIA_WORKSPACE,
+        "title": _cuadro_safe_text(title, 160) or "Cuadro sin título",
+        "avatar_name": "",
+        "avatar_context": "",
+        "work_aspect": "",
+        "think_feel": [],
+        "hear": [],
+        "see": [],
+        "do": [],
+        "analysis_draft": {},
+        "analysis_versions": [],
+        "created_at": now,
+        "updated_at": now,
+    }
+
+
+def _cuadro_normalize_payload(cuadro_id: str, data: Dict[str, Any], existing: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    base = existing.copy() if existing else _cuadro_default_payload(cuadro_id, data.get("title", "Cuadro sin título"))
+    base["id"] = cuadro_id
+    base["workspace_id"] = CUADRO_EMPATIA_WORKSPACE
+    base["title"] = _cuadro_safe_text(data.get("title", base.get("title", "Cuadro sin título")), 160) or "Cuadro sin título"
+    base["avatar_name"] = _cuadro_safe_text(data.get("avatar_name", base.get("avatar_name", "")), 500)
+    base["avatar_context"] = _cuadro_safe_text(data.get("avatar_context", base.get("avatar_context", "")), 6000)
+    base["work_aspect"] = _cuadro_safe_text(data.get("work_aspect", base.get("work_aspect", "")), 6000)
+    for field in ("think_feel", "hear", "see", "do"):
+        base[field] = _cuadro_sanitize_items(data.get(field, base.get(field, [])))
+    analysis = data.get("analysis_draft", base.get("analysis_draft", {}))
+    base["analysis_draft"] = analysis if isinstance(analysis, dict) else {}
+    versions = data.get("analysis_versions", base.get("analysis_versions", []))
+    base["analysis_versions"] = versions if isinstance(versions, list) else []
+    base["created_at"] = base.get("created_at") or _cuadro_now()
+    base["updated_at"] = _cuadro_now()
+    return base
+
+
+def _cuadro_rate_limit_key(request: Request) -> str:
+    return (request.client.host if request.client else "unknown")[:128]
+
+
+def _cuadro_check_rate_limit(request: Request) -> None:
+    key = _cuadro_rate_limit_key(request)
+    now = time.time()
+    with cuadro_empatia_access_attempts_lock:
+        attempts = [stamp for stamp in cuadro_empatia_access_attempts.get(key, []) if now - stamp < CUADRO_EMPATIA_ATTEMPT_WINDOW_SECONDS]
+        cuadro_empatia_access_attempts[key] = attempts
+        if len(attempts) >= CUADRO_EMPATIA_MAX_ATTEMPTS:
+            raise HTTPException(status_code=429, detail="Demasiados intentos. Espera unos minutos antes de volver a intentarlo.")
+
+
+def _cuadro_register_failed_attempt(request: Request) -> None:
+    key = _cuadro_rate_limit_key(request)
+    now = time.time()
+    with cuadro_empatia_access_attempts_lock:
+        attempts = [stamp for stamp in cuadro_empatia_access_attempts.get(key, []) if now - stamp < CUADRO_EMPATIA_ATTEMPT_WINDOW_SECONDS]
+        attempts.append(now)
+        cuadro_empatia_access_attempts[key] = attempts
+
+
+def _cuadro_clear_failed_attempts(request: Request) -> None:
+    with cuadro_empatia_access_attempts_lock:
+        cuadro_empatia_access_attempts.pop(_cuadro_rate_limit_key(request), None)
+
+
+def _cuadro_require_ready_configuration():
+    if not CUADRO_EMPATIA_PASSWORD_HASH or not CUADRO_EMPATIA_SESSION_SECRET:
+        raise HTTPException(status_code=503, detail="La herramienta privada no está disponible en este momento. Intenta nuevamente más tarde.")
+
+
+def _cuadro_encode_token(payload: Dict[str, Any]) -> str:
+    raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    body = base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+    signature = hmac.new(
+        CUADRO_EMPATIA_SESSION_SECRET.encode("utf-8"), body.encode("ascii"), hashlib.sha256
+    ).hexdigest()
+    return f"{body}.{signature}"
+
+
+def _cuadro_decode_token(token: str) -> Optional[Dict[str, Any]]:
+    if not token or "." not in token or not CUADRO_EMPATIA_SESSION_SECRET:
+        return None
+    body, signature = token.rsplit(".", 1)
+    expected = hmac.new(
+        CUADRO_EMPATIA_SESSION_SECRET.encode("utf-8"), body.encode("ascii"), hashlib.sha256
+    ).hexdigest()
+    if not hmac.compare_digest(signature, expected):
+        return None
+    try:
+        padded = body + "=" * (-len(body) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8"))
+        if payload.get("workspace_id") != CUADRO_EMPATIA_WORKSPACE or int(payload.get("exp", 0)) < int(time.time()):
+            return None
+        return payload
+    except Exception:
+        return None
+
+
+def _cuadro_require_session(request: Request) -> Dict[str, Any]:
+    _cuadro_require_ready_configuration()
+    payload = _cuadro_decode_token(request.cookies.get(CUADRO_EMPATIA_SESSION_COOKIE, ""))
+    if not payload:
+        raise HTTPException(status_code=401, detail="Tu sesión privada expiró o no está autorizada. Ingresa nuevamente.")
+    return payload
+
+
+def _cuadro_require_csrf(request: Request) -> None:
+    cookie_value = request.cookies.get(CUADRO_EMPATIA_CSRF_COOKIE, "")
+    header_value = request.headers.get("X-Cuadro-CSRF", "")
+    if not cookie_value or not header_value or not hmac.compare_digest(cookie_value, header_value):
+        raise HTTPException(status_code=403, detail="No pudimos validar la acción privada. Recarga la página e inténtalo nuevamente.")
+
+
+def _cuadro_private_action(request: Request) -> Dict[str, Any]:
+    session = _cuadro_require_session(request)
+    _cuadro_require_csrf(request)
+    return session
+
+
+def _cuadro_get_or_create_sheet(service) -> str:
+    spreadsheet = service.spreadsheets().get(spreadsheetId=GOOGLE_SHEET_ID).execute()
+    names = {sheet["properties"]["title"] for sheet in spreadsheet.get("sheets", [])}
+    if CUADRO_EMPATIA_SHEET_TAB not in names:
+        service.spreadsheets().batchUpdate(
+            spreadsheetId=GOOGLE_SHEET_ID,
+            body={"requests": [{"addSheet": {"properties": {"title": CUADRO_EMPATIA_SHEET_TAB}}}]},
+        ).execute()
+    existing_header = service.spreadsheets().values().get(
+        spreadsheetId=GOOGLE_SHEET_ID,
+        range=f"{CUADRO_EMPATIA_SHEET_TAB}!A1:F1",
+    ).execute().get("values", [])
+    if not existing_header:
+        service.spreadsheets().values().update(
+            spreadsheetId=GOOGLE_SHEET_ID,
+            range=f"{CUADRO_EMPATIA_SHEET_TAB}!A1:F1",
+            valueInputOption="RAW",
+            body={"values": [CUADRO_EMPATIA_HEADERS]},
+        ).execute()
+    return CUADRO_EMPATIA_SHEET_TAB
+
+
+def _cuadro_sheet_rows(service) -> List[List[str]]:
+    tab = _cuadro_get_or_create_sheet(service)
+    return service.spreadsheets().values().get(
+        spreadsheetId=GOOGLE_SHEET_ID,
+        range=f"{tab}!A2:F",
+    ).execute().get("values", [])
+
+
+def _cuadro_find_record(cuadro_id: str) -> Optional[Dict[str, Any]]:
+    service = get_google_sheets_service()
+    rows = _cuadro_sheet_rows(service)
+    for index, row in enumerate(rows, start=2):
+        if len(row) < 4 or row[0] != cuadro_id or row[1] != CUADRO_EMPATIA_WORKSPACE:
+            continue
+        try:
+            payload = json.loads(row[3])
+        except (json.JSONDecodeError, TypeError):
+            raise HTTPException(status_code=500, detail="No pudimos recuperar este cuadro privado. Intenta nuevamente.")
+        if payload.get("workspace_id") != CUADRO_EMPATIA_WORKSPACE:
+            continue
+        return {"row": index, "payload": payload}
+    return None
+
+
+def _cuadro_write_record(cuadro_id: str, payload: Dict[str, Any], existing_row: Optional[int] = None) -> None:
+    service = get_google_sheets_service()
+    tab = _cuadro_get_or_create_sheet(service)
+    row = [[
+        cuadro_id,
+        CUADRO_EMPATIA_WORKSPACE,
+        payload.get("title", "Cuadro sin título"),
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+        payload.get("created_at", _cuadro_now()),
+        payload.get("updated_at", _cuadro_now()),
+    ]]
+    if existing_row:
+        service.spreadsheets().values().update(
+            spreadsheetId=GOOGLE_SHEET_ID,
+            range=f"{tab}!A{existing_row}:F{existing_row}",
+            valueInputOption="RAW",
+            body={"values": row},
+        ).execute()
+    else:
+        service.spreadsheets().values().append(
+            spreadsheetId=GOOGLE_SHEET_ID,
+            range=f"{tab}!A:F",
+            valueInputOption="RAW",
+            insertDataOption="INSERT_ROWS",
+            body={"values": row},
+        ).execute()
+
+
+def _cuadro_delete_record(cuadro_id: str, row_number: int) -> None:
+    service = get_google_sheets_service()
+    tab = _cuadro_get_or_create_sheet(service)
+    spreadsheet = service.spreadsheets().get(spreadsheetId=GOOGLE_SHEET_ID).execute()
+    sheet_id = next(
+        sheet["properties"]["sheetId"]
+        for sheet in spreadsheet.get("sheets", [])
+        if sheet["properties"]["title"] == tab
+    )
+    service.spreadsheets().batchUpdate(
+        spreadsheetId=GOOGLE_SHEET_ID,
+        body={"requests": [{"deleteDimension": {"range": {
+            "sheetId": sheet_id,
+            "dimension": "ROWS",
+            "startIndex": row_number - 1,
+            "endIndex": row_number,
+        }}}]},
+    ).execute()
+
+
+def _cuadro_has_evidence(payload: Dict[str, Any]) -> bool:
+    if not payload.get("avatar_name") or not payload.get("avatar_context") or not payload.get("work_aspect"):
+        return False
+    total = sum(len(payload.get(field, [])) for field in ("think_feel", "hear", "see", "do"))
+    return total >= 4
+
+
+def _cuadro_strip_fences(text: str) -> str:
+    value = (text or "").strip()
+    if value.startswith("```"):
+        value = value.split("\n", 1)[1] if "\n" in value else ""
+        if value.endswith("```"):
+            value = value[:-3]
+    return value.strip()
+
+
+def _cuadro_validate_analysis(analysis: Any) -> Dict[str, Any]:
+    if not isinstance(analysis, dict):
+        raise ValueError("La lectura no tuvo el formato esperado.")
+    required_text = ["strategic_reading", "first_decision", "analysis_limits"]
+    required_lists = ["tensions", "beliefs", "objections", "stimuli", "behaviors", "content_lines", "evidence_gaps"]
+    for key in required_text:
+        if not isinstance(analysis.get(key), str):
+            raise ValueError("La lectura no tuvo el formato esperado.")
+    for key in required_lists:
+        if not isinstance(analysis.get(key), list):
+            raise ValueError("La lectura no tuvo el formato esperado.")
+    lines = analysis["content_lines"][:12]
+    if len(lines) < 8:
+        raise ValueError("La lectura no incluyó suficientes líneas de contenido.")
+    valid_intents = {"validar", "aclarar", "confirmar", "disuadir"}
+    valid_priorities = {"alta", "media", "baja"}
+    normalized_lines = []
+    for line in lines:
+        if not isinstance(line, dict):
+            continue
+        intent = _cuadro_safe_text(line.get("intent", ""), 40).lower()
+        priority = _cuadro_safe_text(line.get("priority", ""), 20).lower()
+        normalized_lines.append({
+            "intent": intent if intent in valid_intents else "aclarar",
+            "priority": priority if priority in valid_priorities else "media",
+            "topic": _cuadro_safe_text(line.get("topic", ""), 500),
+            "angle": _cuadro_safe_text(line.get("angle", ""), 1000),
+            "message": _cuadro_safe_text(line.get("message", ""), 2000),
+            "suggested_format": _cuadro_safe_text(line.get("suggested_format", ""), 300),
+            "opportunity": _cuadro_safe_text(line.get("opportunity", ""), 1000),
+        })
+    if len(normalized_lines) < 8:
+        raise ValueError("La lectura no incluyó suficientes líneas válidas.")
+    return {
+        "strategic_reading": _cuadro_safe_text(analysis["strategic_reading"], 8000),
+        "tensions": [_cuadro_safe_text(x, 1000) for x in analysis["tensions"][:10] if _cuadro_safe_text(x, 1000)],
+        "beliefs": [_cuadro_safe_text(x, 1000) for x in analysis["beliefs"][:10] if _cuadro_safe_text(x, 1000)],
+        "objections": [_cuadro_safe_text(x, 1000) for x in analysis["objections"][:10] if _cuadro_safe_text(x, 1000)],
+        "stimuli": [_cuadro_safe_text(x, 1000) for x in analysis["stimuli"][:10] if _cuadro_safe_text(x, 1000)],
+        "behaviors": [_cuadro_safe_text(x, 1000) for x in analysis["behaviors"][:10] if _cuadro_safe_text(x, 1000)],
+        "first_decision": _cuadro_safe_text(analysis["first_decision"], 3000),
+        "content_lines": normalized_lines,
+        "evidence_gaps": [_cuadro_safe_text(x, 1000) for x in analysis["evidence_gaps"][:10] if _cuadro_safe_text(x, 1000)],
+        "analysis_limits": _cuadro_safe_text(analysis["analysis_limits"], 3000),
+    }
+
+
+def _cuadro_generate_analysis(payload: Dict[str, Any]) -> Dict[str, Any]:
+    if not GEMINI_API_KEY:
+        raise RuntimeError("El análisis privado no está disponible en este momento.")
+    evidence = {
+        "avatar": payload.get("avatar_name", ""),
+        "contexto_avatar": payload.get("avatar_context", ""),
+        "aspecto_a_trabajar": payload.get("work_aspect", ""),
+        "piensa_y_siente": [item.get("text", "") for item in payload.get("think_feel", [])],
+        "oye": [item.get("text", "") for item in payload.get("hear", [])],
+        "ve": [item.get("text", "") for item in payload.get("see", [])],
+        "hace": [item.get("text", "") for item in payload.get("do", [])],
+    }
+    schema = {
+        "strategic_reading": "Lectura de 2 a 4 párrafos en español claro.",
+        "tensions": ["..."],
+        "beliefs": ["..."],
+        "objections": ["..."],
+        "stimuli": ["..."],
+        "behaviors": ["..."],
+        "first_decision": "Decisión operativa concreta.",
+        "content_lines": [{
+            "intent": "validar | aclarar | confirmar | disuadir",
+            "priority": "alta | media | baja",
+            "topic": "",
+            "angle": "",
+            "message": "",
+            "suggested_format": "",
+            "opportunity": "",
+        }],
+        "evidence_gaps": ["..."],
+        "analysis_limits": "Qué no puede concluirse con los datos actuales.",
+    }
+    prompt = f"""{CUADRO_EMPATIA_SYSTEM_PROMPT}
+
+Devuelve ÚNICAMENTE JSON válido, sin markdown, sin texto antes o después y con este esquema exacto:
+{json.dumps(schema, ensure_ascii=False)}
+
+Genera entre 8 y 12 content_lines. Distribuye las intenciones de forma razonada; no fuerces las cuatro si la evidencia no las sostiene.
+
+DATOS ESTRUCTURADOS DEL CUADRO:
+{json.dumps(evidence, ensure_ascii=False)}
+"""
+    client = google_genai.Client(api_key=GEMINI_API_KEY)
+    response = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
+    return _cuadro_validate_analysis(json.loads(_cuadro_strip_fences(response.text)))
+
+
+def _cuadro_pdf_heading(pdf: FPDF, title: str) -> None:
+    pdf.set_font("Helvetica", "B", 14)
+    pdf.set_text_color(44, 62, 80)
+    pdf.multi_cell(0, 7, limpiar_para_pdf(title))
+    pdf.set_draw_color(255, 107, 0)
+    pdf.set_line_width(0.4)
+    pdf.line(15, pdf.get_y(), 195, pdf.get_y())
+    pdf.ln(3)
+
+
+def _cuadro_pdf_paragraph(pdf: FPDF, text: str, bold: bool = False) -> None:
+    if not text:
+        return
+    pdf.set_font("Helvetica", "B" if bold else "", 9.4)
+    pdf.set_text_color(48, 58, 68)
+    pdf.multi_cell(0, 5.1, limpiar_para_pdf(text))
+    pdf.ln(1.5)
+
+
+def _cuadro_pdf_bullets(pdf: FPDF, items: List[str]) -> None:
+    for item in items or []:
+        _cuadro_pdf_paragraph(pdf, f"- {item}")
+
+
+def _cuadro_pdf_add_page_if_needed(pdf: FPDF, needed: float = 30) -> None:
+    if pdf.get_y() + needed > 276:
+        pdf.add_page()
+
+
+class _CuadroEmpatiaPDF(FPDF):
+    def footer(self):
+        self.set_y(-12)
+        self.set_font("Helvetica", "", 8)
+        self.set_text_color(110, 120, 128)
+        self.cell(0, 5, "yosoyelruso.com - Herramienta privada", align="C")
+
+
+def _cuadro_generate_pdf(payload: Dict[str, Any]) -> bytes:
+    pdf = _CuadroEmpatiaPDF(orientation="P", unit="mm", format="A4")
+    pdf.set_auto_page_break(auto=True, margin=17)
+    pdf.set_margins(15, 16, 15)
+    pdf.add_page()
+
+    # Portada
+    pdf.set_fill_color(44, 62, 80)
+    pdf.rect(0, 0, 210, 54, "F")
+    pdf.set_text_color(255, 255, 255)
+    pdf.set_font("Helvetica", "B", 19)
+    pdf.set_xy(15, 18)
+    pdf.multi_cell(180, 8.5, limpiar_para_pdf("Cuadro de Empatía"))
+    pdf.set_font("Helvetica", "", 10)
+    pdf.set_xy(15, 36)
+    pdf.multi_cell(180, 5.5, limpiar_para_pdf("Metodología Anti-Inercia"))
+    pdf.set_text_color(44, 62, 80)
+    pdf.set_y(66)
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.multi_cell(0, 7, limpiar_para_pdf(payload.get("title", "Cuadro sin título")))
+    pdf.ln(3)
+    pdf.set_font("Helvetica", "", 9.5)
+    pdf.set_text_color(100, 110, 120)
+    pdf.multi_cell(0, 5, limpiar_para_pdf(f"Fecha de exportación: {_cuadro_now()[:10]}"))
+    pdf.ln(8)
+
+    _cuadro_pdf_heading(pdf, "Avatar y caso trabajado")
+    _cuadro_pdf_paragraph(pdf, f"Avatar: {payload.get('avatar_name', '')}", bold=True)
+    _cuadro_pdf_paragraph(pdf, f"Contexto: {payload.get('avatar_context', '')}")
+    _cuadro_pdf_paragraph(pdf, f"Aspecto a trabajar: {payload.get('work_aspect', '')}")
+
+    sector_map = [
+        ("PIENSA Y SIENTE", payload.get("think_feel", [])),
+        ("OYE", payload.get("hear", [])),
+        ("VE", payload.get("see", [])),
+        ("HACE", payload.get("do", [])),
+    ]
+    _cuadro_pdf_add_page_if_needed(pdf, 80)
+    _cuadro_pdf_heading(pdf, "Cuadro de Empatía")
+    for label, items in sector_map:
+        _cuadro_pdf_add_page_if_needed(pdf, 28)
+        _cuadro_pdf_paragraph(pdf, label, bold=True)
+        _cuadro_pdf_bullets(pdf, [item.get("text", "") for item in items])
+
+    analysis = payload.get("analysis_draft") or {}
+    if analysis:
+        _cuadro_pdf_add_page_if_needed(pdf, 65)
+        _cuadro_pdf_heading(pdf, "Lectura estratégica")
+        _cuadro_pdf_paragraph(pdf, analysis.get("strategic_reading", ""))
+
+        for label, key in [
+            ("Tensiones", "tensions"),
+            ("Creencias", "beliefs"),
+            ("Objeciones", "objections"),
+            ("Estímulos", "stimuli"),
+            ("Comportamientos", "behaviors"),
+        ]:
+            values = analysis.get(key, [])
+            if values:
+                _cuadro_pdf_add_page_if_needed(pdf, 35)
+                _cuadro_pdf_paragraph(pdf, label, bold=True)
+                _cuadro_pdf_bullets(pdf, values)
+
+        _cuadro_pdf_add_page_if_needed(pdf, 42)
+        _cuadro_pdf_heading(pdf, "Primera decisión operativa")
+        _cuadro_pdf_paragraph(pdf, analysis.get("first_decision", ""), bold=True)
+
+        _cuadro_pdf_add_page_if_needed(pdf, 50)
+        _cuadro_pdf_heading(pdf, "Líneas de contenido")
+        for index, line in enumerate(analysis.get("content_lines", []), start=1):
+            _cuadro_pdf_add_page_if_needed(pdf, 35)
+            _cuadro_pdf_paragraph(pdf, f"{index}. [{line.get('priority', 'media').upper()} · {line.get('intent', 'aclarar')}] {line.get('topic', '')}", bold=True)
+            _cuadro_pdf_paragraph(pdf, f"Ángulo: {line.get('angle', '')}")
+            _cuadro_pdf_paragraph(pdf, f"Mensaje: {line.get('message', '')}")
+            _cuadro_pdf_paragraph(pdf, f"Formato sugerido: {line.get('suggested_format', '')}")
+            _cuadro_pdf_paragraph(pdf, f"Oportunidad: {line.get('opportunity', '')}")
+
+        _cuadro_pdf_add_page_if_needed(pdf, 42)
+        _cuadro_pdf_heading(pdf, "Vacíos de evidencia y límites")
+        _cuadro_pdf_bullets(pdf, analysis.get("evidence_gaps", []))
+        _cuadro_pdf_paragraph(pdf, analysis.get("analysis_limits", ""))
+
+    return bytes(pdf.output())
+
+
+def _cuadro_sanitize_for_client(payload: Dict[str, Any]) -> Dict[str, Any]:
+    return payload
+
+
+@app.post("/cuadro-empatia/access")
+def cuadro_empatia_access(data: CuadroEmpatiaAccessRequest, response: Response, request: Request):
+    _cuadro_require_ready_configuration()
+    _cuadro_check_rate_limit(request)
+    password = data.password.encode("utf-8")
+    try:
+        password_hash = CUADRO_EMPATIA_PASSWORD_HASH.encode("utf-8")
+        valid = bcrypt.checkpw(password, password_hash)
+    except Exception:
+        valid = False
+    if not valid:
+        _cuadro_register_failed_attempt(request)
+        raise HTTPException(status_code=401, detail="La contraseña no es válida.")
+    _cuadro_clear_failed_attempts(request)
+    csrf_token = secrets.token_urlsafe(32)
+    token = _cuadro_encode_token({
+        "workspace_id": CUADRO_EMPATIA_WORKSPACE,
+        "iat": int(time.time()),
+        "exp": int(time.time()) + CUADRO_EMPATIA_SESSION_TTL_SECONDS,
+        "nonce": secrets.token_urlsafe(12),
+    })
+    cookie_options = {
+        "secure": True,
+        "httponly": True,
+        "samesite": "none",
+        "max_age": CUADRO_EMPATIA_SESSION_TTL_SECONDS,
+        "path": "/",
+    }
+    response.set_cookie(CUADRO_EMPATIA_SESSION_COOKIE, token, **cookie_options)
+    response.set_cookie(
+        CUADRO_EMPATIA_CSRF_COOKIE,
+        csrf_token,
+        secure=True,
+        httponly=False,
+        samesite="none",
+        max_age=CUADRO_EMPATIA_SESSION_TTL_SECONDS,
+        path="/",
+    )
+    return {"authorized": True, "csrf_token": csrf_token, "expires_in": CUADRO_EMPATIA_SESSION_TTL_SECONDS}
+
+
+@app.post("/cuadro-empatia/logout")
+def cuadro_empatia_logout(request: Request, response: Response):
+    _cuadro_private_action(request)
+    response.delete_cookie(CUADRO_EMPATIA_SESSION_COOKIE, path="/", secure=True, httponly=True, samesite="none")
+    response.delete_cookie(CUADRO_EMPATIA_CSRF_COOKIE, path="/", secure=True, samesite="none")
+    return {"logged_out": True}
+
+
+@app.get("/cuadro-empatia/session")
+def cuadro_empatia_session(request: Request):
+    session = _cuadro_require_session(request)
+    return {"authorized": True, "workspace_id": session["workspace_id"]}
+
+
+@app.get("/cuadro-empatia/csrf")
+def cuadro_empatia_csrf(request: Request, response: Response):
+    _cuadro_require_session(request)
+    csrf_token = secrets.token_urlsafe(32)
+    response.set_cookie(
+        CUADRO_EMPATIA_CSRF_COOKIE,
+        csrf_token,
+        secure=True,
+        httponly=False,
+        samesite="none",
+        max_age=CUADRO_EMPATIA_SESSION_TTL_SECONDS,
+        path="/",
+    )
+    return {"csrf_token": csrf_token}
+
+
+@app.get("/cuadro-empatia/cuadros")
+def cuadro_empatia_listar(request: Request):
+    _cuadro_require_session(request)
+    try:
+        service = get_google_sheets_service()
+        rows = _cuadro_sheet_rows(service)
+        boards = []
+        for row in rows:
+            if len(row) < 6 or row[1] != CUADRO_EMPATIA_WORKSPACE:
+                continue
+            boards.append({
+                "id": row[0],
+                "title": row[2] or "Cuadro sin título",
+                "created_at": row[4],
+                "updated_at": row[5],
+            })
+        boards.sort(key=lambda board: board.get("updated_at", ""), reverse=True)
+        return {"cuadros": boards}
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=500, detail="No pudimos cargar el archivo de cuadros. Intenta nuevamente.")
+
+
+@app.post("/cuadro-empatia/cuadros")
+def cuadro_empatia_crear(request: Request, data: Optional[Dict[str, Any]] = None):
+    _cuadro_private_action(request)
+    try:
+        cuadro_id = str(uuid.uuid4())
+        title = (data or {}).get("title", "Cuadro sin título")
+        payload = _cuadro_default_payload(cuadro_id, title)
+        _cuadro_write_record(cuadro_id, payload)
+        return {"cuadro": _cuadro_sanitize_for_client(payload)}
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=500, detail="No pudimos crear el cuadro. Intenta nuevamente.")
+
+
+@app.get("/cuadro-empatia/cuadros/{cuadro_id}")
+def cuadro_empatia_obtener(cuadro_id: str, request: Request):
+    _cuadro_require_session(request)
+    record = _cuadro_find_record(cuadro_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="No encontramos este cuadro privado.")
+    return {"cuadro": _cuadro_sanitize_for_client(record["payload"])}
+
+
+@app.put("/cuadro-empatia/cuadros/{cuadro_id}")
+def cuadro_empatia_guardar(cuadro_id: str, request: Request, data: CuadroEmpatiaPayload):
+    _cuadro_private_action(request)
+    record = _cuadro_find_record(cuadro_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="No encontramos este cuadro privado.")
+    try:
+        payload = _cuadro_normalize_payload(cuadro_id, data.model_dump(), record["payload"])
+        _cuadro_write_record(cuadro_id, payload, record["row"])
+        return {"saved": True, "cuadro": _cuadro_sanitize_for_client(payload)}
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=500, detail="No pudimos guardar este cuadro. Tu borrador local permanece disponible.")
+
+
+@app.delete("/cuadro-empatia/cuadros/{cuadro_id}")
+def cuadro_empatia_eliminar(cuadro_id: str, request: Request):
+    _cuadro_private_action(request)
+    record = _cuadro_find_record(cuadro_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="No encontramos este cuadro privado.")
+    try:
+        _cuadro_delete_record(cuadro_id, record["row"])
+        return {"deleted": True}
+    except Exception:
+        raise HTTPException(status_code=500, detail="No pudimos eliminar el cuadro. Intenta nuevamente.")
+
+
+@app.post("/cuadro-empatia/cuadros/{cuadro_id}/analizar")
+def cuadro_empatia_analizar(cuadro_id: str, request: Request):
+    _cuadro_private_action(request)
+    record = _cuadro_find_record(cuadro_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="No encontramos este cuadro privado.")
+    payload = record["payload"]
+    if not _cuadro_has_evidence(payload):
+        raise HTTPException(status_code=400, detail="Completa avatar, contexto, aspecto y al menos cuatro observaciones antes de solicitar la lectura estratégica.")
+    try:
+        analysis = _cuadro_generate_analysis(payload)
+        previous = payload.get("analysis_draft") or {}
+        if previous:
+            payload.setdefault("analysis_versions", []).append({
+                "version_id": str(uuid.uuid4()),
+                "created_at": _cuadro_now(),
+                "source": "lectura_anterior",
+                "analysis": previous,
+            })
+        payload["analysis_draft"] = analysis
+        payload["updated_at"] = _cuadro_now()
+        _cuadro_write_record(cuadro_id, payload, record["row"])
+        return {"analyzed": True, "cuadro": _cuadro_sanitize_for_client(payload)}
+    except HTTPException:
+        raise
+    except (json.JSONDecodeError, ValueError):
+        raise HTTPException(status_code=502, detail="La IA no devolvió una lectura estructurada. El cuadro se conserva; inténtalo nuevamente.")
+    except Exception:
+        raise HTTPException(status_code=502, detail="No pudimos generar la lectura estratégica. El cuadro se conserva; inténtalo nuevamente.")
+
+
+@app.get("/cuadro-empatia/cuadros/{cuadro_id}/exportar-pdf")
+def cuadro_empatia_exportar_pdf(cuadro_id: str, request: Request):
+    _cuadro_require_session(request)
+    record = _cuadro_find_record(cuadro_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="No encontramos este cuadro privado.")
+    if not record["payload"].get("analysis_draft"):
+        raise HTTPException(status_code=400, detail="Genera y revisa la lectura estratégica antes de exportar el PDF.")
+    try:
+        pdf_bytes = _cuadro_generate_pdf(record["payload"])
+        filename = f"cuadro-empatia-{cuadro_id[:8]}.pdf"
+        return StreamingResponse(
+            io.BytesIO(pdf_bytes),
+            media_type="application/pdf",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+    except Exception:
+        raise HTTPException(status_code=500, detail="No pudimos exportar el PDF. Guarda el cuadro e inténtalo nuevamente.")
+
+
+@app.get("/cuadro-empatia/health")
+def cuadro_empatia_health():
+    return {"status": "ready", "service": "Cuadro de Empatía privado"}

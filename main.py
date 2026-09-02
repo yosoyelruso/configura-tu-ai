@@ -12,7 +12,6 @@ import base64
 import secrets
 import time
 import pdfplumber
-import bcrypt
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.application import MIMEApplication
@@ -111,11 +110,12 @@ GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
 GMAIL_USER = os.getenv("GMAIL_USER", "fedor.sawoloka@gmail.com")
 GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
 
-# Cuadro de Empatía privado. Estas variables se definen exclusivamente en Render.
-CUADRO_EMPATIA_PASSWORD_HASH = os.getenv("CUADRO_EMPATIA_PASSWORD_HASH")
+# Cuadro de Empatía privado. El acceso se concede manualmente por correo
+# desde la pestaña privada Acceso_Cuadro_Empatia de Google Sheets.
 CUADRO_EMPATIA_SESSION_SECRET = os.getenv("CUADRO_EMPATIA_SESSION_SECRET")
 CUADRO_EMPATIA_SHEET_TAB = "Cuadro_Empatia"
-CUADRO_EMPATIA_WORKSPACE = "fedor_privado"
+CUADRO_EMPATIA_ACCESS_SHEET_TAB = "Acceso_Cuadro_Empatia"
+CUADRO_EMPATIA_WORKSPACE = "cuadro_empatia"
 CUADRO_EMPATIA_SESSION_COOKIE = "cuadro_empatia_session"
 CUADRO_EMPATIA_CSRF_COOKIE = "cuadro_empatia_csrf"
 CUADRO_EMPATIA_SESSION_TTL_SECONDS = 60 * 60 * 12
@@ -3120,7 +3120,7 @@ class CuadroEmpatiaPayload(BaseModel):
     analysis_versions: List[Dict[str, Any]] = []
 
 class CuadroEmpatiaAccessRequest(BaseModel):
-    password: str
+    email: EmailStr
 
 
 def _cuadro_now() -> str:
@@ -3145,11 +3145,12 @@ def _cuadro_sanitize_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return sanitized
 
 
-def _cuadro_default_payload(cuadro_id: str, title: str = "Cuadro sin título") -> Dict[str, Any]:
+def _cuadro_default_payload(cuadro_id: str, title: str = "Cuadro sin título", owner_id: str = "") -> Dict[str, Any]:
     now = _cuadro_now()
     return {
         "id": cuadro_id,
         "workspace_id": CUADRO_EMPATIA_WORKSPACE,
+        "_owner_id": owner_id,
         "title": _cuadro_safe_text(title, 160) or "Cuadro sin título",
         "avatar_name": "",
         "avatar_context": "",
@@ -3213,8 +3214,60 @@ def _cuadro_clear_failed_attempts(request: Request) -> None:
 
 
 def _cuadro_require_ready_configuration():
-    if not CUADRO_EMPATIA_PASSWORD_HASH or not CUADRO_EMPATIA_SESSION_SECRET:
+    if not CUADRO_EMPATIA_SESSION_SECRET:
         raise HTTPException(status_code=503, detail="La herramienta privada no está disponible en este momento. Intenta nuevamente más tarde.")
+
+
+def _cuadro_normalize_email(email: str) -> str:
+    return str(email or "").strip().lower()
+
+
+def _cuadro_owner_id(email: str) -> str:
+    normalized = _cuadro_normalize_email(email)
+    return hashlib.sha256(f"cuadro-empatia:{normalized}".encode("utf-8")).hexdigest()
+
+
+def _cuadro_get_or_create_access_sheet(service) -> str:
+    spreadsheet = service.spreadsheets().get(spreadsheetId=GOOGLE_SHEET_ID).execute()
+    names = {sheet["properties"]["title"] for sheet in spreadsheet.get("sheets", [])}
+    if CUADRO_EMPATIA_ACCESS_SHEET_TAB not in names:
+        service.spreadsheets().batchUpdate(
+            spreadsheetId=GOOGLE_SHEET_ID,
+            body={"requests": [{"addSheet": {"properties": {"title": CUADRO_EMPATIA_ACCESS_SHEET_TAB}}}]},
+        ).execute()
+    header = service.spreadsheets().values().get(
+        spreadsheetId=GOOGLE_SHEET_ID,
+        range=f"{CUADRO_EMPATIA_ACCESS_SHEET_TAB}!A1:B1",
+    ).execute().get("values", [])
+    if not header:
+        service.spreadsheets().values().update(
+            spreadsheetId=GOOGLE_SHEET_ID,
+            range=f"{CUADRO_EMPATIA_ACCESS_SHEET_TAB}!A1:B1",
+            valueInputOption="RAW",
+            body={"values": [["Email", "Activo"]]},
+        ).execute()
+    return CUADRO_EMPATIA_ACCESS_SHEET_TAB
+
+
+def _cuadro_email_is_authorized(email: str) -> bool:
+    normalized = _cuadro_normalize_email(email)
+    if not normalized:
+        return False
+    try:
+        service = get_google_sheets_service()
+        tab = _cuadro_get_or_create_access_sheet(service)
+        rows = service.spreadsheets().values().get(
+            spreadsheetId=GOOGLE_SHEET_ID,
+            range=f"{tab}!A2:B",
+        ).execute().get("values", [])
+    except Exception:
+        raise HTTPException(status_code=503, detail="No pudimos verificar el acceso privado. Intenta nuevamente más tarde.")
+    for row in rows:
+        if not row or _cuadro_normalize_email(row[0]) != normalized:
+            continue
+        status = str(row[1] if len(row) > 1 else "").strip().upper()
+        return status in {"SI", "SÍ", "YES", "ACTIVO", "1", "TRUE"}
+    return False
 
 
 def _cuadro_encode_token(payload: Dict[str, Any]) -> str:
@@ -3296,7 +3349,7 @@ def _cuadro_sheet_rows(service) -> List[List[str]]:
     ).execute().get("values", [])
 
 
-def _cuadro_find_record(cuadro_id: str) -> Optional[Dict[str, Any]]:
+def _cuadro_find_record(cuadro_id: str, owner_id: str) -> Optional[Dict[str, Any]]:
     service = get_google_sheets_service()
     rows = _cuadro_sheet_rows(service)
     for index, row in enumerate(rows, start=2):
@@ -3306,7 +3359,7 @@ def _cuadro_find_record(cuadro_id: str) -> Optional[Dict[str, Any]]:
             payload = json.loads(row[3])
         except (json.JSONDecodeError, TypeError):
             raise HTTPException(status_code=500, detail="No pudimos recuperar este cuadro privado. Intenta nuevamente.")
-        if payload.get("workspace_id") != CUADRO_EMPATIA_WORKSPACE:
+        if payload.get("workspace_id") != CUADRO_EMPATIA_WORKSPACE or payload.get("_owner_id") != owner_id:
             continue
         return {"row": index, "payload": payload}
     return None
@@ -3593,26 +3646,24 @@ def _cuadro_generate_pdf(payload: Dict[str, Any]) -> bytes:
 
 
 def _cuadro_sanitize_for_client(payload: Dict[str, Any]) -> Dict[str, Any]:
-    return payload
+    clean = dict(payload)
+    clean.pop("_owner_id", None)
+    return clean
 
 
 @app.post("/cuadro-empatia/access")
 def cuadro_empatia_access(data: CuadroEmpatiaAccessRequest, response: Response, request: Request):
     _cuadro_require_ready_configuration()
     _cuadro_check_rate_limit(request)
-    password = data.password.encode("utf-8")
-    try:
-        password_hash = CUADRO_EMPATIA_PASSWORD_HASH.encode("utf-8")
-        valid = bcrypt.checkpw(password, password_hash)
-    except Exception:
-        valid = False
-    if not valid:
+    email = _cuadro_normalize_email(data.email)
+    if not _cuadro_email_is_authorized(email):
         _cuadro_register_failed_attempt(request)
-        raise HTTPException(status_code=401, detail="La contraseña no es válida.")
+        raise HTTPException(status_code=401, detail="Este correo no está autorizado para acceder al Cuadro de Empatía.")
     _cuadro_clear_failed_attempts(request)
     csrf_token = secrets.token_urlsafe(32)
     token = _cuadro_encode_token({
         "workspace_id": CUADRO_EMPATIA_WORKSPACE,
+        "owner_id": _cuadro_owner_id(email),
         "iat": int(time.time()),
         "exp": int(time.time()) + CUADRO_EMPATIA_SESSION_TTL_SECONDS,
         "nonce": secrets.token_urlsafe(12),
@@ -3669,13 +3720,22 @@ def cuadro_empatia_csrf(request: Request, response: Response):
 
 @app.get("/cuadro-empatia/cuadros")
 def cuadro_empatia_listar(request: Request):
-    _cuadro_require_session(request)
+    session = _cuadro_require_session(request)
+    owner_id = session.get("owner_id", "")
+    if not owner_id:
+        raise HTTPException(status_code=401, detail="Tu sesión privada expiró o no está autorizada. Ingresa nuevamente.")
     try:
         service = get_google_sheets_service()
         rows = _cuadro_sheet_rows(service)
         boards = []
         for row in rows:
             if len(row) < 6 or row[1] != CUADRO_EMPATIA_WORKSPACE:
+                continue
+            try:
+                payload = json.loads(row[3])
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if payload.get("_owner_id") != owner_id:
                 continue
             boards.append({
                 "id": row[0],
@@ -3693,11 +3753,14 @@ def cuadro_empatia_listar(request: Request):
 
 @app.post("/cuadro-empatia/cuadros")
 def cuadro_empatia_crear(request: Request, data: Optional[Dict[str, Any]] = None):
-    _cuadro_private_action(request)
+    session = _cuadro_private_action(request)
+    owner_id = session.get("owner_id", "")
+    if not owner_id:
+        raise HTTPException(status_code=401, detail="Tu sesión privada expiró o no está autorizada. Ingresa nuevamente.")
     try:
         cuadro_id = str(uuid.uuid4())
         title = (data or {}).get("title", "Cuadro sin título")
-        payload = _cuadro_default_payload(cuadro_id, title)
+        payload = _cuadro_default_payload(cuadro_id, title, owner_id)
         _cuadro_write_record(cuadro_id, payload)
         return {"cuadro": _cuadro_sanitize_for_client(payload)}
     except HTTPException:
@@ -3708,8 +3771,8 @@ def cuadro_empatia_crear(request: Request, data: Optional[Dict[str, Any]] = None
 
 @app.get("/cuadro-empatia/cuadros/{cuadro_id}")
 def cuadro_empatia_obtener(cuadro_id: str, request: Request):
-    _cuadro_require_session(request)
-    record = _cuadro_find_record(cuadro_id)
+    session = _cuadro_require_session(request)
+    record = _cuadro_find_record(cuadro_id, session.get("owner_id", ""))
     if not record:
         raise HTTPException(status_code=404, detail="No encontramos este cuadro privado.")
     return {"cuadro": _cuadro_sanitize_for_client(record["payload"])}
@@ -3717,8 +3780,8 @@ def cuadro_empatia_obtener(cuadro_id: str, request: Request):
 
 @app.put("/cuadro-empatia/cuadros/{cuadro_id}")
 def cuadro_empatia_guardar(cuadro_id: str, request: Request, data: CuadroEmpatiaPayload):
-    _cuadro_private_action(request)
-    record = _cuadro_find_record(cuadro_id)
+    session = _cuadro_private_action(request)
+    record = _cuadro_find_record(cuadro_id, session.get("owner_id", ""))
     if not record:
         raise HTTPException(status_code=404, detail="No encontramos este cuadro privado.")
     try:
@@ -3733,8 +3796,8 @@ def cuadro_empatia_guardar(cuadro_id: str, request: Request, data: CuadroEmpatia
 
 @app.delete("/cuadro-empatia/cuadros/{cuadro_id}")
 def cuadro_empatia_eliminar(cuadro_id: str, request: Request):
-    _cuadro_private_action(request)
-    record = _cuadro_find_record(cuadro_id)
+    session = _cuadro_private_action(request)
+    record = _cuadro_find_record(cuadro_id, session.get("owner_id", ""))
     if not record:
         raise HTTPException(status_code=404, detail="No encontramos este cuadro privado.")
     try:
@@ -3746,8 +3809,8 @@ def cuadro_empatia_eliminar(cuadro_id: str, request: Request):
 
 @app.post("/cuadro-empatia/cuadros/{cuadro_id}/analizar")
 def cuadro_empatia_analizar(cuadro_id: str, request: Request):
-    _cuadro_private_action(request)
-    record = _cuadro_find_record(cuadro_id)
+    session = _cuadro_private_action(request)
+    record = _cuadro_find_record(cuadro_id, session.get("owner_id", ""))
     if not record:
         raise HTTPException(status_code=404, detail="No encontramos este cuadro privado.")
     payload = record["payload"]
@@ -3777,8 +3840,8 @@ def cuadro_empatia_analizar(cuadro_id: str, request: Request):
 
 @app.get("/cuadro-empatia/cuadros/{cuadro_id}/exportar-pdf")
 def cuadro_empatia_exportar_pdf(cuadro_id: str, request: Request):
-    _cuadro_require_session(request)
-    record = _cuadro_find_record(cuadro_id)
+    session = _cuadro_require_session(request)
+    record = _cuadro_find_record(cuadro_id, session.get("owner_id", ""))
     if not record:
         raise HTTPException(status_code=404, detail="No encontramos este cuadro privado.")
     if not record["payload"].get("analysis_draft"):

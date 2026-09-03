@@ -36,53 +36,84 @@ app = FastAPI(title="Fedor Sawoloka - API Backend v4.0")
 # ============================================================
 # Almacena los trabajos en memoria. En Render (plan Starter)
 # el proceso vive indefinidamente, así que esto es seguro.
-# Los trabajos se limpian automáticamente después de 1 hora.
+# Los PDFs temporales se mantienen solo mientras el usuario descarga su resultado.
+# Se aplican límites porque Render Starter dispone de 512 MB y no es una base de archivos.
+JOB_TTL_SECONDS = 45 * 60
+JOB_MAX_RETAINED_PDFS = 8
+JOB_MAX_RETAINED_PDF_BYTES = 24 * 1024 * 1024
 
 jobs: Dict[str, Dict[str, Any]] = {}
 jobs_lock = threading.Lock()
 
-def crear_job(job_id: str):
-    """Crea un nuevo trabajo en estado 'processing'."""
-    with jobs_lock:
-        jobs[job_id] = {
-            'status': 'processing',
-            'created_at': datetime.now().isoformat(),
-            'pdf_bytes': None,
-            'filename': None,
-            'error': None
-        }
 
-def completar_job(job_id: str, pdf_bytes: bytes, filename: str):
-    """Marca un trabajo como completado con el PDF generado."""
-    with jobs_lock:
-        if job_id in jobs:
-            jobs[job_id]['status'] = 'done'
-            jobs[job_id]['pdf_bytes'] = pdf_bytes
-            jobs[job_id]['filename'] = filename
+def _job_created_at(job: Dict[str, Any]) -> datetime:
+    try:
+        return datetime.fromisoformat(job.get("created_at", ""))
+    except (TypeError, ValueError):
+        return datetime.min
 
-def fallar_job(job_id: str, error: str):
-    """Marca un trabajo como fallido."""
-    with jobs_lock:
-        if job_id in jobs:
-            jobs[job_id]['status'] = 'error'
-            jobs[job_id]['error'] = error
+
+def _limpiar_jobs_viejos_locked() -> None:
+    """Libera trabajos terminales vencidos y limita los PDFs retenidos en RAM."""
+    ahora = datetime.now()
+    terminales = []
+    for job_id, job in list(jobs.items()):
+        if job.get("status") not in {"done", "error"}:
+            continue
+        edad = (ahora - _job_created_at(job)).total_seconds()
+        if edad > JOB_TTL_SECONDS:
+            del jobs[job_id]
+            continue
+        if isinstance(job.get("pdf_bytes"), bytes):
+            terminales.append((job_id, job))
+
+    terminales.sort(key=lambda item: _job_created_at(item[1]))
+    total_bytes = sum(len(job["pdf_bytes"]) for _, job in terminales)
+    while terminales and (
+        len(terminales) > JOB_MAX_RETAINED_PDFS
+        or total_bytes > JOB_MAX_RETAINED_PDF_BYTES
+    ):
+        job_id, job = terminales.pop(0)
+        total_bytes -= len(job["pdf_bytes"])
+        del jobs[job_id]
+
 
 def limpiar_jobs_viejos():
-    """Elimina trabajos con más de 1 hora de antigüedad."""
-    from datetime import timedelta
-    ahora = datetime.now()
-    con_jobs_lock = threading.Lock()
+    """Ejecuta la limpieza de memoria de la cola temporal de trabajos."""
     with jobs_lock:
-        ids_a_eliminar = []
-        for jid, job in jobs.items():
-            try:
-                creado = datetime.fromisoformat(job['created_at'])
-                if (ahora - creado) > timedelta(hours=1):
-                    ids_a_eliminar.append(jid)
-            except:
-                pass
-        for jid in ids_a_eliminar:
-            del jobs[jid]
+        _limpiar_jobs_viejos_locked()
+
+
+def crear_job(job_id: str):
+    """Crea un nuevo trabajo y elimina resultados temporales que ya no deben permanecer en RAM."""
+    with jobs_lock:
+        _limpiar_jobs_viejos_locked()
+        jobs[job_id] = {
+            "status": "processing",
+            "created_at": datetime.now().isoformat(),
+            "pdf_bytes": None,
+            "filename": None,
+            "error": None,
+        }
+
+
+def completar_job(job_id: str, pdf_bytes: bytes, filename: str, retain_pdf: bool = True):
+    """Marca un trabajo como completado y retiene el PDF solo cuando existe una descarga posterior."""
+    with jobs_lock:
+        if job_id in jobs:
+            jobs[job_id]["status"] = "done"
+            jobs[job_id]["pdf_bytes"] = pdf_bytes if retain_pdf else None
+            jobs[job_id]["filename"] = filename
+            _limpiar_jobs_viejos_locked()
+
+
+def fallar_job(job_id: str, error: str):
+    """Marca un trabajo como fallido y aplica la limpieza preventiva."""
+    with jobs_lock:
+        if job_id in jobs:
+            jobs[job_id]["status"] = "error"
+            jobs[job_id]["error"] = error
+            _limpiar_jobs_viejos_locked()
 
 # CORS: permitir peticiones desde yosoyelruso.com y localhost
 app.add_middleware(
@@ -1846,6 +1877,7 @@ def consultar_job(job_id: str):
 @app.get("/programa/job/{job_id}/pdf")
 def descargar_pdf_job(job_id: str):
     """Descarga el PDF de un trabajo completado."""
+    limpiar_jobs_viejos()
     with jobs_lock:
         job = jobs.get(job_id)
     if not job:
@@ -3039,7 +3071,8 @@ def _procesar_mapa_fuga(job_id: str, data: MapaFugaRequest):
                     "nivel": clasificacion["nivel"],
                     "fuga_principal": clasificacion["fuga_principal"],
                 }
-        completar_job(job_id, pdf_bytes, "mapa-de-fuga-comercial.pdf")
+        # El PDF del Mapa ya fue enviado por correo; no se conserva otra copia en RAM.
+        completar_job(job_id, pdf_bytes, "mapa-de-fuga-comercial.pdf", retain_pdf=False)
     except Exception as e:
         print(f"Error procesando Mapa de Fuga Comercial {job_id}: {e}")
         fallar_job(job_id, str(e))

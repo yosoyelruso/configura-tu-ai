@@ -3293,22 +3293,29 @@ def _cuadro_decode_token(token: str) -> Optional[Dict[str, Any]]:
 
 def _cuadro_require_session(request: Request) -> Dict[str, Any]:
     _cuadro_require_ready_configuration()
-    payload = _cuadro_decode_token(request.cookies.get(CUADRO_EMPATIA_SESSION_COOKIE, ""))
+    # Algunos navegadores bloquean cookies de terceros entre yosoyelruso.com y
+    # onrender.com. El token firmado también puede viajar como encabezado desde
+    # sessionStorage; nunca se persiste y CORS limita el origen autorizado.
+    token = request.headers.get("X-Cuadro-Session", "") or request.cookies.get(CUADRO_EMPATIA_SESSION_COOKIE, "")
+    payload = _cuadro_decode_token(token)
     if not payload:
         raise HTTPException(status_code=401, detail="Tu sesión privada expiró o no está autorizada. Ingresa nuevamente.")
     return payload
 
 
-def _cuadro_require_csrf(request: Request) -> None:
-    cookie_value = request.cookies.get(CUADRO_EMPATIA_CSRF_COOKIE, "")
+def _cuadro_require_csrf(request: Request, session: Dict[str, Any]) -> None:
     header_value = request.headers.get("X-Cuadro-CSRF", "")
-    if not cookie_value or not header_value or not hmac.compare_digest(cookie_value, header_value):
+    session_value = str(session.get("csrf", ""))
+    cookie_value = request.cookies.get(CUADRO_EMPATIA_CSRF_COOKIE, "")
+    valid_header_session = bool(header_value and session_value and hmac.compare_digest(header_value, session_value))
+    valid_header_cookie = bool(header_value and cookie_value and hmac.compare_digest(header_value, cookie_value))
+    if not (valid_header_session or valid_header_cookie):
         raise HTTPException(status_code=403, detail="No pudimos validar la acción privada. Actualiza la página e inténtalo nuevamente.")
 
 
 def _cuadro_private_action(request: Request) -> Dict[str, Any]:
     session = _cuadro_require_session(request)
-    _cuadro_require_csrf(request)
+    _cuadro_require_csrf(request, session)
     return session
 
 
@@ -3491,10 +3498,11 @@ def cuadro_empatia_access(data: CuadroEmpatiaAccessRequest, response: Response, 
         "iat": int(time.time()),
         "exp": int(time.time()) + CUADRO_EMPATIA_SESSION_TTL_SECONDS,
         "nonce": secrets.token_urlsafe(12),
+        "csrf": csrf_token,
     })
     response.set_cookie(CUADRO_EMPATIA_SESSION_COOKIE, token, secure=True, httponly=True, samesite="none", max_age=CUADRO_EMPATIA_SESSION_TTL_SECONDS, path="/")
     response.set_cookie(CUADRO_EMPATIA_CSRF_COOKIE, csrf_token, secure=True, httponly=False, samesite="none", max_age=CUADRO_EMPATIA_SESSION_TTL_SECONDS, path="/")
-    return {"authorized": True, "csrf_token": csrf_token, "expires_in": CUADRO_EMPATIA_SESSION_TTL_SECONDS}
+    return {"authorized": True, "csrf_token": csrf_token, "session_token": token, "expires_in": CUADRO_EMPATIA_SESSION_TTL_SECONDS}
 
 
 @app.post("/cuadro-empatia/logout")
@@ -3513,8 +3521,10 @@ def cuadro_empatia_session(request: Request):
 
 @app.get("/cuadro-empatia/csrf")
 def cuadro_empatia_csrf(request: Request, response: Response):
-    _cuadro_require_session(request)
-    csrf_token = secrets.token_urlsafe(32)
+    session = _cuadro_require_session(request)
+    csrf_token = str(session.get("csrf", ""))
+    if not csrf_token:
+        raise HTTPException(status_code=401, detail="Tu sesión privada expiró o no está autorizada. Ingresa nuevamente.")
     response.set_cookie(CUADRO_EMPATIA_CSRF_COOKIE, csrf_token, secure=True, httponly=False, samesite="none", max_age=CUADRO_EMPATIA_SESSION_TTL_SECONDS, path="/")
     return {"csrf_token": csrf_token}
 

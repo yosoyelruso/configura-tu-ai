@@ -46,6 +46,7 @@ JOB_MAX_RETAINED_PDF_BYTES = 24 * 1024 * 1024
 
 jobs: Dict[str, Dict[str, Any]] = {}
 jobs_lock = threading.Lock()
+mapa_fuga_sheet_migration_lock = threading.Lock()
 
 
 def _job_created_at(job: Dict[str, Any]) -> datetime:
@@ -2834,6 +2835,7 @@ class MapaFugaRequest(BaseModel):
     utm_source: Optional[str] = ""
     utm_medium: Optional[str] = ""
     utm_campaign: Optional[str] = ""
+    utm_content: Optional[str] = ""
     turnstile_token: str = ""
 
     @field_validator("nombre")
@@ -2854,12 +2856,15 @@ class MapaFugaRequest(BaseModel):
     def validate_business_context(cls, value: str, info):
         return _clean_public_text(value, 180, info.field_name)
 
-    @field_validator("utm_source", "utm_medium", "utm_campaign")
+    @field_validator("utm_source", "utm_medium", "utm_campaign", "utm_content")
     @classmethod
     def validate_utm(cls, value: Optional[str], info):
         if not value:
             return ""
-        return _clean_public_text(str(value), 180, info.field_name)
+        cleaned = _clean_public_text(str(value), 180, info.field_name)
+        if re.search(r"[<>]|(?:javascript|data)\s*:", cleaned, re.IGNORECASE):
+            raise ValueError(f"{info.field_name} contiene un formato no permitido.")
+        return cleaned
 
     @field_validator(
         "q1_respuesta", "q2_cac", "q3_clientes", "q4_capacidad", "q5_previsibilidad",
@@ -3153,32 +3158,102 @@ def generate_mapa_fuga_pdf(documento: str, empresa: str) -> bytes:
     return bytes(pdf.output())
 
 
+MAPA_FUGA_SHEET_TITLE = "Autodiagnostico_AntiInercia"
+MAPA_FUGA_SHEET_HEADERS = [
+    "Fecha", "Nombre", "Email", "WhatsApp", "Empresa", "Sector",
+    "Q1_Respuesta", "Q2_CAC", "Q3_Clientes", "Q4_Capacidad", "Q5_Previsibilidad",
+    "Q6_Seguimiento", "Q7_Redes", "Q8_PropuestaValor", "Q9_MarketingVentas", "Q10_Rentabilidad",
+    "Puntaje", "Nivel", "Fuga_Principal", "Fugas_Secundarias", "Puntajes_por_Bloque",
+    "UTM_Source", "UTM_Medium", "UTM_Campaign", "UTM_Content", "Consentimiento", "Email_Enviado",
+]
+MAPA_FUGA_LEGACY_SHEET_HEADERS = [header for header in MAPA_FUGA_SHEET_HEADERS if header != "UTM_Content"]
+
+
+def _mapa_fuga_header_cells(headers: List[str]) -> List[dict]:
+    return [{"userEnteredValue": {"stringValue": header}} for header in headers]
+
+
 def get_or_create_mapa_fuga_sheet(service):
-    """Garantiza una pestaña propia para el lead magnet sin tocar las pestañas existentes."""
-    titulo = "Autodiagnostico_AntiInercia"
-    spreadsheet = service.spreadsheets().get(spreadsheetId=GOOGLE_SHEET_ID).execute()
-    hojas = {sheet["properties"]["title"] for sheet in spreadsheet.get("sheets", [])}
-    if titulo not in hojas:
+    """Crea o migra solo la pestaña del Mapa sin alterar registros históricos."""
+    titulo = MAPA_FUGA_SHEET_TITLE
+    with mapa_fuga_sheet_migration_lock:
+        spreadsheet = service.spreadsheets().get(spreadsheetId=GOOGLE_SHEET_ID).execute()
+        sheets_by_title = {
+            sheet["properties"]["title"]: sheet["properties"]
+            for sheet in spreadsheet.get("sheets", [])
+        }
+        sheet_properties = sheets_by_title.get(titulo)
+
+        if not sheet_properties:
+            service.spreadsheets().batchUpdate(
+                spreadsheetId=GOOGLE_SHEET_ID,
+                body={"requests": [{"addSheet": {"properties": {"title": titulo}}}]},
+            ).execute()
+            service.spreadsheets().values().update(
+                spreadsheetId=GOOGLE_SHEET_ID,
+                range=f"{titulo}!A1:AA1",
+                valueInputOption="RAW",
+                body={"values": [MAPA_FUGA_SHEET_HEADERS]},
+            ).execute()
+            return titulo
+
+        valores = service.spreadsheets().values().get(
+            spreadsheetId=GOOGLE_SHEET_ID, range=f"{titulo}!A1:AA1"
+        ).execute().get("values", [])
+        encabezados_actuales = valores[0] if valores else []
+
+        if encabezados_actuales == MAPA_FUGA_SHEET_HEADERS:
+            return titulo
+
+        if not encabezados_actuales:
+            filas_existentes = service.spreadsheets().values().get(
+                spreadsheetId=GOOGLE_SHEET_ID, range=f"{titulo}!A2:AA"
+            ).execute().get("values", [])
+            if any(any(str(cell).strip() for cell in fila) for fila in filas_existentes):
+                raise RuntimeError("La pestaña del Mapa tiene datos sin encabezados; no se puede migrar automáticamente.")
+            service.spreadsheets().values().update(
+                spreadsheetId=GOOGLE_SHEET_ID,
+                range=f"{titulo}!A1:AA1",
+                valueInputOption="RAW",
+                body={"values": [MAPA_FUGA_SHEET_HEADERS]},
+            ).execute()
+            return titulo
+
+        if encabezados_actuales != MAPA_FUGA_LEGACY_SHEET_HEADERS:
+            raise RuntimeError("La estructura de la pestaña del Mapa no coincide con el esquema esperado; no se modificó ningún dato.")
+
+        # La API usa índices desde cero: 24 es Y. Se inserta antes de Y y los
+        # datos históricos de Consentimiento y Email_Enviado pasan a Z y AA.
         service.spreadsheets().batchUpdate(
             spreadsheetId=GOOGLE_SHEET_ID,
-            body={"requests": [{"addSheet": {"properties": {"title": titulo}}}]},
-        ).execute()
-    headers = [
-        "Fecha", "Nombre", "Email", "WhatsApp", "Empresa", "Sector",
-        "Q1_Respuesta", "Q2_CAC", "Q3_Clientes", "Q4_Capacidad", "Q5_Previsibilidad",
-        "Q6_Seguimiento", "Q7_Redes", "Q8_PropuestaValor", "Q9_MarketingVentas", "Q10_Rentabilidad",
-        "Puntaje", "Nivel", "Fuga_Principal", "Fugas_Secundarias", "Puntajes_por_Bloque",
-        "UTM_Source", "UTM_Medium", "UTM_Campaign", "Consentimiento", "Email_Enviado",
-    ]
-    valores = service.spreadsheets().values().get(
-        spreadsheetId=GOOGLE_SHEET_ID, range=f"{titulo}!A1:Z1"
-    ).execute().get("values", [])
-    if not valores:
-        service.spreadsheets().values().update(
-            spreadsheetId=GOOGLE_SHEET_ID,
-            range=f"{titulo}!A1:Z1",
-            valueInputOption="RAW",
-            body={"values": [headers]},
+            body={
+                "requests": [
+                    {
+                        "insertDimension": {
+                            "range": {
+                                "sheetId": sheet_properties["sheetId"],
+                                "dimension": "COLUMNS",
+                                "startIndex": 24,
+                                "endIndex": 25,
+                            },
+                            "inheritFromBefore": True,
+                        }
+                    },
+                    {
+                        "updateCells": {
+                            "range": {
+                                "sheetId": sheet_properties["sheetId"],
+                                "startRowIndex": 0,
+                                "endRowIndex": 1,
+                                "startColumnIndex": 0,
+                                "endColumnIndex": len(MAPA_FUGA_SHEET_HEADERS),
+                            },
+                            "rows": [{"values": _mapa_fuga_header_cells(MAPA_FUGA_SHEET_HEADERS)}],
+                            "fields": "userEnteredValue",
+                        }
+                    },
+                ]
+            },
         ).execute()
     return titulo
 
@@ -3194,12 +3269,12 @@ def save_mapa_fuga_to_google_sheets(data: MapaFugaRequest, clasificacion: dict, 
             data.q6_seguimiento, data.q7_redes, data.q8_propuesta_valor, data.q9_marketing_ventas, data.q10_rentabilidad,
             clasificacion["puntaje_total"], clasificacion["nivel"], clasificacion["fuga_principal"],
             ", ".join(clasificacion["fugas_secundarias"]), json.dumps(clasificacion["puntajes_bloque"], ensure_ascii=False),
-            data.utm_source or "", data.utm_medium or "", data.utm_campaign or "",
+            data.utm_source or "", data.utm_medium or "", data.utm_campaign or "", data.utm_content or "",
             "Sí" if data.consentimiento else "No", "Sí" if email_enviado else "No",
         ]
         service.spreadsheets().values().append(
             spreadsheetId=GOOGLE_SHEET_ID,
-            range=f"{titulo}!A:Z",
+            range=f"{titulo}!A:AA",
             valueInputOption="RAW",
             body={"values": [row]},
         ).execute()
@@ -4212,4 +4287,3 @@ def cuadro_empatia_generar_pdf(request: Request, data: CuadroEmpatiaPayload):
 @app.get("/cuadro-empatia/health")
 def cuadro_empatia_health():
     return {"status": "ready", "service": "Cuadro de Empatía privado", "mode": "ephemeral"}
-

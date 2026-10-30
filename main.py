@@ -110,12 +110,15 @@ def completar_job(job_id: str, pdf_bytes: bytes, filename: str, retain_pdf: bool
             _limpiar_jobs_viejos_locked()
 
 
+GENERATION_FAILURE_MESSAGE = "No pudimos completar el documento en este momento. Inténtalo nuevamente."
+
+
 def fallar_job(job_id: str, error: str):
-    """Marca un trabajo como fallido y aplica la limpieza preventiva."""
+    """Marca un trabajo como fallido sin revelar detalles internos al navegador."""
     with jobs_lock:
         if job_id in jobs:
             jobs[job_id]["status"] = "error"
-            jobs[job_id]["error"] = error
+            jobs[job_id]["error"] = GENERATION_FAILURE_MESSAGE
             _limpiar_jobs_viejos_locked()
 
 # CORS: permitir peticiones desde yosoyelruso.com y localhost
@@ -537,6 +540,61 @@ def _configura_document_is_complete(document: str) -> bool:
             return False
 
     return document.rstrip().endswith(CONFIGURA_DOCUMENT_CLOSING)
+
+
+PROGRAM_DOCUMENT_CLOSING = "Documento generado por el Programa Anti-Inercia de Marca Personal | Metodologia de Fedor Sawoloka | yosoyelruso.com"
+PROGRAM_DOCUMENT_SPECS = {
+    0: {"sections": ("Diagnóstico de Punto Cero", "Radiografía del Negocio", "Estado de la Presencia Digital", "Fricciones Identificadas", "Nivel de Disposición para Ejecutar", "Lo que viene: Tus Próximas Prioridades"), "min_chars": 800, "max_output_tokens": 3500},
+    1: {"sections": ("Resumen Ejecutivo", "Oportunidad de Mercado", "Auditoría de Presencia Digital", "Análisis de Competencia y Referentes", "Diagnóstico FODA", "Identificación de Inercias Críticas", "El Arquetipo Ganador", "Diagnóstico Final", "El Siguiente Paso"), "min_chars": 1500, "max_output_tokens": 6500},
+    2: {"sections": ("El Problema Raíz", "Los 5 Pilares del ADN de Marca", "El Arquetipo Ganador", "Validación del Documento Maestro", "Lo que viene: Módulo 3"), "min_chars": 1200, "max_output_tokens": 4500},
+    3: {"sections": ("Introducción y Objetivos", "Los 3 Pilares Estratégicos de Contenido", "Sistema de Conversión", "Plan de Implementación en Fases", "Las 3 Métricas que Debe Revisar", "Protocolo de Ajuste — Los 3 Escenarios", "Propuesta de Colaboración"), "min_chars": 1500, "max_output_tokens": 6000},
+    4: {"sections": ("Arquitectura de Contenido Semanal", "Banco de Ideas y Hooks", "Guía de Contenido Completa", "Protocolo de Reciclaje", "Las 3 Plantillas de Arranque", "Protocolo de Contingencia", "Validación del Sistema", "Lo que viene: Módulo 5"), "min_chars": 2200, "max_output_tokens": 12000},
+    5: {"sections": ("Resumen Ejecutivo de Marca Personal", "Sus 3 Inercias Críticas y Cómo el Plan las Contrarresta", "Plan de Acción Semana a Semana — Primeros 30 Días", "Las 3 Métricas que Debe Revisar", "Protocolo de Ajuste — Los 3 Escenarios", "Su Primera Publicación Estructurada", "Propuesta de Colaboración"), "min_chars": 1500, "max_output_tokens": 6500},
+}
+
+
+def _program_document_is_complete(document: str, module: int) -> bool:
+    """Acepta solo documentos completos antes de permitir su conversión en PDF."""
+    spec = PROGRAM_DOCUMENT_SPECS[module]
+    if not isinstance(document, str) or len(document.strip()) < spec["min_chars"]:
+        return False
+    for title in spec["sections"]:
+        pattern = rf"(?im)^\s*#{{2,6}}\s*{re.escape(title)}\s*$"
+        if not re.search(pattern, document):
+            return False
+    return document.rstrip().endswith(PROGRAM_DOCUMENT_CLOSING)
+
+
+def _generate_program_document(client, prompt: str, module: int) -> str:
+    """Genera, comprueba y reintenta una vez cada documento del Programa."""
+    spec = PROGRAM_DOCUMENT_SPECS[module]
+    retry_instruction = (
+        "\n\nCONTROL DE CALIDAD DEL REINTENTO:\n"
+        "La respuesta anterior no llegó completa. Redacta nuevamente el documento entero, "
+        "de forma concisa pero suficiente. Debes completar todas las secciones obligatorias "
+        "y cerrar con la firma exacta indicada. No termines a mitad de ninguna sección.\n"
+    )
+    last_error = ""
+    for attempt in range(2):
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt + (retry_instruction if attempt else ""),
+            config=google_genai.types.GenerateContentConfig(
+                temperature=0.2,
+                max_output_tokens=spec["max_output_tokens"],
+                thinking_config=google_genai.types.ThinkingConfig(thinking_budget=0),
+            ),
+        )
+        document = str(getattr(response, "text", "") or "").strip()
+        finish_reason = _configura_finish_reason(response)
+        if finish_reason != "STOP":
+            last_error = f"Gemini terminó con {finish_reason or 'un estado no verificable'}"
+        elif not _program_document_is_complete(document, module):
+            last_error = "Gemini devolvió un documento incompleto"
+        else:
+            return document
+        print(f"Programa Anti-Inercia: módulo {module}, intento {attempt + 1} no apto ({last_error}).")
+    raise RuntimeError(last_error or "Gemini no devolvió un documento completo")
 
 
 def generate_document_gemini(data: FormData) -> str:
@@ -1169,11 +1227,7 @@ BLOQUE 5 — CONTEXTO:
 - Presupuesto disponible: {respuestas.get('presupuesto', 'No respondido')}
 """
 
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=prompt
-    )
-    return response.text
+    return _generate_program_document(client, prompt, 0)
 
 
 # ============================================================
@@ -1608,11 +1662,7 @@ PARTE 5 — INERCIAS CRÍTICAS:
 - Inercia 3 — Qué ha intentado para romperla: {respuestas.get('inercia3_intentos', 'No respondido')}
 """
 
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=prompt
-    )
-    return response.text
+    return _generate_program_document(client, prompt, 1)
 
 
 def generate_modulo2_gemini(respuestas: dict, contexto_previo: str) -> str:
@@ -1725,11 +1775,7 @@ PARTE 4 — VALIDACIÓN FINAL:
 - ¿Diferenciador es demostrable?: {respuestas.get('val_diferenciador', 'No respondido')}
 """
 
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=prompt
-    )
-    return response.text
+    return _generate_program_document(client, prompt, 2)
 
 
 def generate_modulo3_gemini(respuestas: dict, contexto_previo: str) -> str:
@@ -1846,11 +1892,7 @@ PARTE 5 — VALIDACIÓN ESTRATÉGICA:
 - Qué bloquea el arranque (si aplica): {respuestas.get('val_bloqueo', 'No respondido')}
 """
 
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=prompt
-    )
-    return response.text
+    return _generate_program_document(client, prompt, 3)
 
 
 # ============================================================
@@ -2592,11 +2634,7 @@ PARTE 5 — VALIDACIÓN:
 - ¿Herramientas de producción definidas?: {respuestas.get('val_herramientas', 'No respondido')}
 """
 
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=prompt
-    )
-    return response.text
+    return _generate_program_document(client, prompt, 4)
 
 
 def generate_modulo5_gemini(respuestas: dict, contexto_previo: str) -> str:
@@ -2702,11 +2740,7 @@ PARTE 5 — DUDAS Y RESULTADO ESPERADO:
 - Resultado específico en 30 días que justificaría la inversión: {respuestas.get('resultado_30dias', 'No respondido')}
 """
 
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=prompt
-    )
-    return response.text
+    return _generate_program_document(client, prompt, 5)
 
 
 # ── Módulo 4 asíncrono ──
@@ -3090,6 +3124,28 @@ def clasificar_mapa_fuga(data: MapaFugaRequest) -> dict:
     }
 
 
+MAPA_FUGA_MAX_OUTPUT_TOKENS = 1400
+MAPA_FUGA_REQUIRED_SECTIONS = (
+    "Tu Mapa de Fuga Comercial",
+    "Resultado principal",
+    "Lo que tus respuestas revelan",
+    "El riesgo de mantener esta inercia",
+    "Tu primera prioridad",
+    "El siguiente paso",
+)
+MAPA_FUGA_CLOSING = "Mapa de Fuga Comercial | Metodología Anti-Inercia de Fedor Sawoloka | yosoyelruso.com"
+
+
+def _mapa_fuga_document_is_complete(document: str) -> bool:
+    """Comprueba las secciones, la firma y el límite editorial del lead magnet."""
+    if not isinstance(document, str) or len(document.strip()) < 350 or len(document.split()) > 430:
+        return False
+    for title in MAPA_FUGA_REQUIRED_SECTIONS:
+        if not re.search(rf"(?im)^\s*#{{1,6}}\s*{re.escape(title)}\s*$", document):
+            return False
+    return document.rstrip().endswith(MAPA_FUGA_CLOSING)
+
+
 def generate_mapa_fuga_gemini(data: MapaFugaRequest, clasificacion: dict) -> str:
     """Genera un diagnóstico breve y personalizado, deliberadamente limitado para no sustituir una Auditoría 45D."""
     client = google_genai.Client(api_key=GEMINI_API_KEY)
@@ -3144,8 +3200,30 @@ Incluye exactamente esta idea, adaptada con naturalidad: "Este mapa identifica d
 ---
 Mapa de Fuga Comercial | Metodología Anti-Inercia de Fedor Sawoloka | yosoyelruso.com
 """
-    response = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
-    return response.text
+    last_error = ""
+    for attempt in range(2):
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt + (
+                "\n\nCONTROL DE CALIDAD DEL REINTENTO: entrega el mapa completo, "
+                "conciso, con todas las secciones y la firma final exacta." if attempt else ""
+            ),
+            config=google_genai.types.GenerateContentConfig(
+                temperature=0.2,
+                max_output_tokens=MAPA_FUGA_MAX_OUTPUT_TOKENS,
+                thinking_config=google_genai.types.ThinkingConfig(thinking_budget=0),
+            ),
+        )
+        document = str(getattr(response, "text", "") or "").strip()
+        finish_reason = _configura_finish_reason(response)
+        if finish_reason != "STOP":
+            last_error = f"Gemini terminó con {finish_reason or 'un estado no verificable'}"
+        elif not _mapa_fuga_document_is_complete(document):
+            last_error = "Gemini devolvió un Mapa de Fuga incompleto"
+        else:
+            return document
+        print(f"Mapa de Fuga Comercial: intento {attempt + 1} no apto ({last_error}).")
+    raise RuntimeError(last_error or "Gemini no devolvió un Mapa de Fuga completo")
 
 
 def generate_mapa_fuga_fallback(data: MapaFugaRequest, clasificacion: dict) -> str:
@@ -3448,10 +3526,11 @@ def _procesar_mapa_fuga(job_id: str, data: MapaFugaRequest, release_generation_s
         clasificacion = clasificar_mapa_fuga(data)
         try:
             documento = generate_mapa_fuga_gemini(data, clasificacion)
+            pdf_bytes = generate_mapa_fuga_pdf(documento, data.empresa)
         except Exception as e:
-            print(f"Gemini falló en Mapa de Fuga Comercial: {e}")
+            print(f"Mapa de Fuga Comercial: se usa respaldo controlado ({e})")
             documento = generate_mapa_fuga_fallback(data, clasificacion)
-        pdf_bytes = generate_mapa_fuga_pdf(documento, data.empresa)
+            pdf_bytes = generate_mapa_fuga_pdf(documento, data.empresa)
         email_enviado = send_mapa_fuga_by_email(data.email, data.nombre, data.empresa, clasificacion, pdf_bytes)
         if not email_enviado:
             raise RuntimeError("El diagnóstico fue generado, pero no pudo entregarse al correo indicado.")
@@ -4135,11 +4214,15 @@ def _cuadro_validate_analysis(analysis: Any) -> Dict[str, Any]:
     for line in analysis["content_lines"]:
         if not isinstance(line, dict):
             continue
+        limits = {"title": 500, "angle": 1000, "content_idea": 2200, "suggested_format": 300}
+        raw = {key: str(line.get(key, "") or "").strip() for key in limits}
+        if any(len(raw[key]) > limit for key, limit in limits.items()):
+            raise ValueError("La IA devolvió una idea demasiado extensa para el formato del PDF.")
         normalized = {
-            "title": _cuadro_safe_text(line.get("title", ""), 500),
-            "angle": _cuadro_safe_text(line.get("angle", ""), 1000),
-            "content_idea": _cuadro_safe_text(line.get("content_idea", ""), 2200),
-            "suggested_format": _cuadro_safe_text(line.get("suggested_format", ""), 300),
+            "title": raw["title"],
+            "angle": raw["angle"],
+            "content_idea": raw["content_idea"],
+            "suggested_format": raw["suggested_format"],
         }
         if all(normalized.values()):
             lines.append(normalized)
@@ -4179,9 +4262,31 @@ Devuelve ÚNICAMENTE JSON válido, sin markdown, sin texto antes o después y co
   ]
 }}
 
-Devuelve exactamente 8 ideas. No incluyas recomendaciones operativas, ofertas, consultas, llamadas a agendar, ventas, vacíos de evidencia, límites ni campos adicionales."""
-    response = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
-    return _cuadro_validate_analysis(json.loads(_cuadro_strip_fences(response.text)))
+Devuelve exactamente 8 ideas. Mantén cada campo claro y conciso para que las ocho ideas puedan leerse completas en el PDF. No incluyas recomendaciones operativas, ofertas, consultas, llamadas a agendar, ventas, vacíos de evidencia, límites ni campos adicionales."""
+    last_error = ""
+    for attempt in range(2):
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt + (
+                "\n\nCONTROL DE CALIDAD DEL REINTENTO: entrega exactamente ocho ideas completas en JSON válido; no termines ningún campo a mitad de una idea." if attempt else ""
+            ),
+            config=google_genai.types.GenerateContentConfig(
+                temperature=0.2,
+                max_output_tokens=8192,
+                response_mime_type="application/json",
+                thinking_config=google_genai.types.ThinkingConfig(thinking_budget=0),
+            ),
+        )
+        finish_reason = _configura_finish_reason(response)
+        if finish_reason != "STOP":
+            last_error = f"Gemini terminó con {finish_reason or 'un estado no verificable'}"
+            continue
+        try:
+            raw_response = str(getattr(response, "text", "") or "")
+            return _cuadro_validate_analysis(json.loads(_cuadro_strip_fences(raw_response)))
+        except (json.JSONDecodeError, ValueError) as error:
+            last_error = str(error)
+    raise ValueError(last_error or "La IA no devolvió ocho ideas completas.")
 
 
 class _CuadroEmpatiaPDF(FPDF):

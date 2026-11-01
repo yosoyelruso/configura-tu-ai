@@ -303,8 +303,8 @@ CONFIGURA_IA_ALLOWED_CHOICES = {
     "nivel_autonomia": {"Solo me responde", "Me da opciones", "Me guía en decisiones", "Me estructura el trabajo", "Actúa como copiloto estratégico"},
     "tipo_resultado": {"Ideas y creatividad", "Estrategia general", "Planes de acción", "Sistemas de trabajo completos", "Ejecución guiada paso a paso"},
     "importancia_accion": {"Poco importante", "Moderado", "Muy importante", "Crítico (quiero acción constante)"},
-    "estilo_comunicacion": {"Directo y al grano", "Académico y detallado", "Creativo e inspirador", "Pragmático y orientado a la acción", "Con humor", "Estrictamente profesional"},
-    "formato_preferido": {"Párrafos estructurados", "Bullet points", "Tablas comparativas", "Resúmenes ejecutivos", "Paso a paso accionable"},
+    "estilo_comunicacion": {"Directo y al grano", "Académico y detallado", "Creativo e inspirador", "Pragmático y orientado a la acción", "Con humor", "Cercano y conversacional", "Estrictamente profesional"},
+    "formato_preferido": {"Párrafos estructurados", "Bullet points", "Puntos clave", "Tablas comparativas", "Resúmenes ejecutivos", "Paso a paso accionable"},
 }
 
 PROMPT_INJECTION_PATTERN = re.compile(
@@ -428,6 +428,10 @@ CONFIGURA_PROJECT_ALLOWED_CHOICES = {
         "Paso a paso con validación",
         "Propuesta completa con alternativas",
         "Plan de ejecución con prioridades",
+        "Primero analiza la situación antes de proponer soluciones",
+        "Avanza paso a paso y valida conmigo antes de continuar",
+        "Presenta una propuesta completa con alternativas para elegir",
+        "Construye un plan de ejecución ordenado por prioridades",
     },
     "estilo_comunicacion": CONFIGURA_IA_ALLOWED_CHOICES["estilo_comunicacion"],
     "formato_preferido": CONFIGURA_IA_ALLOWED_CHOICES["formato_preferido"],
